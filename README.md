@@ -1,122 +1,57 @@
-# MEMTIS: Efficient Memory Tiering with Dynamic Page Classification and Page Size Determination
+# Adaptive-PEBS: 基于物理地址驱动与不确定性感知的自适应内存分层系统
 
-## System configuration
-* Fedora 33 server
-* Two 20-core Intel(R) Xeon(R) Gold 5218R CPU @ 2.10GHz
-* 6 x 16GB DRAM per socket
-* 6 x 128GB Intel Optane DC Persistent Memory per socket
+## 📖 项目简介
 
-MEMTIS currently supports two system configurations
-* DRAM + Intel DCPMM (used only single socket)
-* local DRAM + remote DRAM (used two socket, CXL emulation mode)
+**Adaptive-PEBS** 是一个针对分层内存系统 (Tiered Memory System, 如 DRAM + CXL/PMem) 设计的高效、精准的页面热度感知与迁移系统。
 
-## Source code information
-See linux/
+本项目旨在解决传统基于硬件事件采样 (PEBS) 在大内存场景下面临的采样倾斜、开销过高以及自适应性不足等问题。我们通过**纯物理地址驱动**和**基于采样收益的动态闭环控制**，实现了在极低 CPU 开销下对“温数据”的高敏锐捕获。
 
-You have to enable CONFIG\_HTMM when compiling the linux source.
-```
-make menuconfig
-...
-CONFIG_HTMM=y
-...
-```
+> **注：** 本项目基于 [Memtis](https://github.com/...) 内核模块进行二次开发与重构。
 
-### Dependencies
-There are nothing special libraries for MEMTIS itself.
+---
 
-(You just need to install libraries for Linux compilation.)
+## ⚠️ 现有技术的痛点 (Motivation)
 
-## For experiments
-### Userspace scripts
-See memtis-userspace/
+![tiered memory system architecture](./images/architecture.png)
+*(注：建议在此处插入分层内存架构图)*
 
-Please read memtis-userspace/README.md for detailed explanations
+在现代数据中心负载中，现有的热度感知技术（以 AutoNUMA, TPP, 原版 Memtis 为代表）存在以下四个核心缺陷：
 
-### Setting tiered memory systems with Intel DCPMM
-* Reconfigures a namespace with devdax mode
-```
-sudo ndctl create-namespace -f -e namespace0.0 --mode=devdax
-...
-```
-* Reconfigures a dax device with system-ram mode (KMEM DAX)
-```
-sudo daxctl reconfigure-device dax0.0 --mode=system-ram
-...
-```
+* **感知盲区（采集倾斜）：** 物理地址空间的访问呈现严重的“马太效应”。Ring Buffer 容易被少数极热页面填满，导致系统忽略了正在变热的大规模“温数据”。
+* **死板的静态配置：** 现有的静态采样周期 (Period) 和允许滑移的配置 (`precise_ip=1`) 无法适应动态变化的负载，且在密集指令流中会导致归因地址偏离。
+* **虚拟地址转换开销极高：** 默认基于虚拟地址的采样，迫使内核频繁执行昂贵的页表遍历，加剧 TLB Miss，与业务主线程争抢资源。
+* **热度统计偏差：** 传统的“采样命中即 +1”的方式，忽略了动态采样周期的权重，导致高频采样下的冷页得分可能超过低频采样下的热页。
 
-### Preparing benchmarks
-We used open-sourced benchmarks except SPECCPU2017.
+---
 
-We provided links to each benchmark source in memtis-userspace/bench\_dir/README.md
+## 🚀 核心特性与技术突破 (Core Innovations)
 
-### Running benchmarks
-It is necessary to create/update a simple script for each benchmark.
-If you want to execute *XSBench*, for instance, you have to create memtis-userspace/bench\_cmds/XSBench.sh.
+### 1. 零开销的物理地址驱动 (Physical-Index Driven)
 
-This is a sample.
-```
-# memtis-userspace/bench_cmds/XSBench.sh
+* **硬件零滑移：** 强制开启硬件 `precise_ip=2` (PEBS Assist) 和 `PERF_SAMPLE_PHYS_ADDR`，确保记录的物理地址与触发事件的指令 100% 对应。
+* **O(1) 线性索引：** 利用 Linux 内核 `vmemmap` 线性映射机制，直接使用物理页帧号 (PFN) 寻址 `struct page`，彻底消除了页表遍历开销。
 
-BIN=/path/to/benchmark
-BENCH_RUN="${BIN}/XSBench [Options]"
+### 2. 基于 "采样收益" 的全局资源调度 (ROI-based Adaptive Control)
 
-# Provide the DRAM size for each memory configuration setting.
-# You must first check the resident set size of a benchmark.
-if [[ "x${NVM_RATIO}" == "x1:16" ]]; then
-    BENCH_DRAM="3850MB"
-elif [[ "x${NVM_RATIO}" == "x1:8" ]]; then
-    BENCH_DRAM="7200MB"
-elif [[ "x${NVM_RATIO}" == "x1:2" ]]; then
-    BENCH_DRAM="21800MB"
-fi
+系统将 PMU 中断配额视为稀缺资源，基于多维收益评估动态分配采样周期：
 
-# required
-export BENCH_RUN
-export BENCH_DRAM
+* **空间维度 (离散度 $S_{disp}$)：** 奖励空间覆盖率高的发散型事件（如 LLC_MISS），惩罚陷入局部死循环的密集型事件（如 LOAD）。
+* **时间维度 (抖动度 $\tilde{S}_{Vibrate}$)：** 移植 TCP 的 Jacobson/Karels 算法，量化页面的抖动强度。**核心洞察**：高抖动页面意味着数据正在变热（非稳态），系统自动向其倾斜采样资源，加速温数据的捕获。
+* **综合收益模型：** $$V(E_{i})=\alpha\cdot S_{disp}(E_{i})+\beta\cdot\tilde{S}_{Vibrate}(E_{i})+\tilde{S}_{hotness}(E_{i})*c+\tilde{S}_{overhead}(E_{i})$$
 
-```
+### 3. 紧凑型无锁元数据 (Compact Lock-free Metadata)
 
-#### Test
-```
-cd memtis-userspace/
+利用 Linux 的 `page_ext` 机制，将页面状态高度压缩进 64-bit 整数中，单页仅增加 8 字节开销。结合 CAS 原语，实现了 NMI 上下文安全的无锁 (Lock-free) 并发更新。
 
-# check running options
-./scripts/run_bench.sh --help
+* **64-bit 布局：** `[Fluctuation (8b) | Interval (8b) | Last_Hit (16b) | Reserved (12b) | Hit_Count (20b)]`。
 
-# create an executable binary file
-make
+### 4. 统计修正的归一化迁移 (Normalized Migration)
 
-# run
-sudo ./scripts/run_bench.sh -B ${BENCH} -R ${MEM_CONFIG} -V ${TEST_NAME}
-## or use scripts
-sudo ./run-fig5-6-10.sh
-sudo ./run-fig7.sh
-...
-```
+在页面迁移扫描时，执行读时归一化，消除动态采样频率带来的偏差，还原真实的物理访问强度。
 
-#### Tips for setting other tiered memory systems
-See memtis-userspace/README.md
+* **修正公式：** $Real\_Hotness = Hit\_Count \times Period_{current}$
+* **冷却机制：** 后台线程周期性执行右移位移（指数衰减）操作，清除历史热度噪声。
 
-## Commit number used for artifact evaluation
-174ca88
+---
 
-## License
-<a rel="license" href="http://creativecommons.org/licenses/by-nc/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc/4.0/88x31.png" /></a><br />This work is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-nc/4.0/">Creative Commons Attribution-NonCommercial 4.0 International License</a>.
-
-## Bibtex
-```
-@inproceedings{10.1145/3600006.3613167,
-author = {Lee, Taehyung and Monga, Sumit Kumar and Min, Changwoo and Eom, Young Ik},
-title = {MEMTIS: Efficient Memory Tiering with Dynamic Page Classification and Page Size Determination},
-year = {2023},
-doi = {10.1145/3600006.3613167},
-booktitle = {Proceedings of the 29th Symposium on Operating Systems Principles},
-series = {SOSP '23}
-}
-```
-
-## Authors
-- Taehyung Lee (Sungkyunkwan University, SKKU) <taehyung.tlee@gmail.com>
-- Sumit Kumar Monga (Virginia Tech) <sumitkm@vt.edu>
-- Changwoo Min (Virginia Tech) <changwoo@vt.edu>
-- Young Ik Eom (Sungkyunkwan University, SKKU) <yieom@skku.edu>
+## ⚙️ 系统架构 (Architecture)
