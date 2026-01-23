@@ -91,9 +91,9 @@ unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages)
 {
     max_nr_pages = max_nr_pages * 3 / 100; // 3%
     if (max_nr_pages < MAX_WATERMARK_LOWER_LIMIT)
-	return MAX_WATERMARK_LOWER_LIMIT;
+	return MIN_WATERMARK_LOWER_LIMIT;
     else if (max_nr_pages > MAX_WATERMARK_UPPER_LIMIT)
-	return MAX_WATERMARK_UPPER_LIMIT;
+	return MIN_WATERMARK_UPPER_LIMIT;
     else
 	return max_nr_pages;
 }
@@ -967,7 +967,8 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 	}
 
 	/* performs split */
-	if (!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
+	if (htmm_thres_split != 0 &&
+		!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
 	    unsigned long nr_split;
 	    nr_split = deferred_split_scan_for_htmm(pn, &split_list);
 	    if (!list_empty(&split_list)) {
@@ -1035,7 +1036,8 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
 	}
 
 	/* performs split */
-	if (!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
+	if (htmm_thres_split != 0 &&
+		!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
 	    unsigned long nr_split;
 	    nr_split = deferred_split_scan_for_htmm(pn, &split_list);
 	    if (!list_empty(&split_list)) {
