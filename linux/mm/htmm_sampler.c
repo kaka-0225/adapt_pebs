@@ -95,8 +95,8 @@ static int pebs_init(pid_t pid, int node)
 {
 	int cpu, event;
 
-	mem_event = kzalloc(sizeof(struct perf_event **) * num_online_cpus(),
-			    GFP_KERNEL);
+	mem_event =
+		kzalloc(sizeof(struct perf_event **) * nr_cpu_ids, GFP_KERNEL);
 	for_each_online_cpu (cpu) {
 		mem_event[cpu] = kzalloc(
 			sizeof(struct perf_event *) * N_HTMMEVENTS, GFP_KERNEL);
@@ -127,7 +127,16 @@ static void pebs_disable(void)
 {
 	int cpu, event;
 	printk("pebs disable\n");
+
+	/* Check if mem_event was initialized */
+	if (!mem_event)
+		return;
+
 	for_each_online_cpu (cpu) {
+		/* Check if this CPU's event array was allocated */
+		if (!mem_event[cpu])
+			continue;
+
 		for (event = 0; event < N_HTMMEVENTS; event++) {
 			if (mem_event[cpu][event])
 				perf_event_disable(mem_event[cpu][event]);
