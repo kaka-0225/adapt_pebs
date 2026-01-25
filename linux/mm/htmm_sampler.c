@@ -60,13 +60,14 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 		attr.sample_period = htmm_inst_sample_period;
 	else
 		attr.sample_period = get_sample_period(0);
-	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
+	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR |
+			   PERF_SAMPLE_TIME;
 	attr.disabled = 0;
 	attr.exclude_kernel = 1;
 	attr.exclude_hv = 1;
 	attr.exclude_callchain_kernel = 1;
 	attr.exclude_callchain_user = 1;
-	attr.precise_ip = 0;
+	attr.precise_ip = 1;
 	attr.enable_on_exec = 1;
 
 	if (pid == 0)
@@ -300,15 +301,15 @@ static int ksamplingd(void *data)
 						// ============================================================
 						// 🆕 新增：使用 trace_printk 记录 PEBS 采样
 						// ============================================================
-						trace_printk(
-							"[PEBS] CPU=%d Event=%d PID=%u TID=%u Addr=0x%lx IP=0x%llx\n",
-							cpu, event, he->pid,
-							he->tid, he->addr,
-							he->ip);
+
 						if (!valid_va(he->addr)) {
 							break;
 						}
-
+						trace_printk(
+							"[PEBS] CPU=%d Event=%d PID=%u TID=%u Addr=0x%lx IP=0x%llx Time=%llu\n",
+							cpu, event, he->pid,
+							he->tid, he->addr,
+							he->ip, he->time);
 						update_pginfo(he->pid, he->addr,
 							      event);
 						//count_vm_event(HTMM_NR_SAMPLED);

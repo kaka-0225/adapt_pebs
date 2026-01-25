@@ -60,8 +60,9 @@ function func_memtis_setting() {
 	echo "disabled" | tee /sys/kernel/mm/htmm/htmm_cxl_mode
     fi
 
-    echo "always" | tee /sys/kernel/mm/transparent_hugepage/enabled
-    echo "always" | tee /sys/kernel/mm/transparent_hugepage/defrag
+    echo "never" | tee /sys/kernel/mm/transparent_hugepage/enabled
+    echo "never" | tee /sys/kernel/mm/transparent_hugepage/defrag
+	sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on'
 }
 
 function func_prepare() {
