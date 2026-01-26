@@ -5,12 +5,24 @@
 #define BUFFER_SIZE 32 /* 128: 1MB */
 #define CPUS_PER_SOCKET 20
 #define MAX_MIGRATION_RATE_IN_MBPS 2048 /* 2048MB per sec */
+#define L2_SAMPLE_PERIOD 50000 /* L2 cache fixed sampling period */
 
-/* pebs events */
-#define DRAM_LLC_LOAD_MISS 0x1d3
+/* pebs events - Ice Lake (ICL) */
+#define ICL_L1_HIT 0x01d1
+#define ICL_L1_MISS 0x08d1
+#define ICL_L2_HIT 0x02d1
+#define ICL_L2_MISS 0x10d1
+#define ICL_L3_HIT 0x04d1
+#define ICL_L3_MISS 0x20d1
+#define ICL_LOCAL_DRAM 0x01d3
+#define ICL_LOCAL_PMM 0x80d1
+#define ICL_ALL_STORES 0x82d0
+
+/* legacy aliases (backward compatibility) */
+#define DRAM_LLC_LOAD_MISS ICL_LOCAL_DRAM
 #define REMOTE_DRAM_LLC_LOAD_MISS 0x2d3
-#define NVM_LLC_LOAD_MISS 0x80d1
-#define ALL_STORES 0x82d0
+#define NVM_LLC_LOAD_MISS ICL_LOCAL_PMM
+#define ALL_STORES ICL_ALL_STORES
 #define ALL_LOADS 0x81d0
 #define STLB_MISS_STORES 0x12d0
 #define STLB_MISS_LOADS 0x11d0
@@ -81,13 +93,16 @@ struct htmm_event {
 };
 
 enum events {
-	DRAMREAD = 0,
-	NVMREAD = 1,
-	MEMWRITE = 2,
-	TLB_MISS_LOADS = 3,
-	TLB_MISS_STORES = 4,
-	CXLREAD = 5, // emulated by remote DRAM node
-	N_HTMMEVENTS
+	L1_HIT = 0,
+	L1_MISS = 1,
+	L2_HIT = 2,
+	L2_MISS = 3,
+	L3_HIT = 4,
+	L3_MISS = 5,
+	DRAMREAD = 6,
+	NVMREAD = 7,
+	MEMWRITE = 8,
+	N_HTMMEVENTS // now 9 events
 };
 
 /* htmm_core.c */

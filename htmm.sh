@@ -17,7 +17,7 @@ if [[ ! -f "$INITRD" ]]; then
 fi
 
 echo "Loading kexec kernel: $KERNEL_VERSION"
-sudo kexec -l "$VMLINUX" --initrd="$INITRD" --command-line="$(cat /proc/cmdline)"
+sudo kexec -l "$VMLINUX" --initrd="$INITRD" --command-line="$(cat /proc/cmdline) mem=90G "
 
 echo "Executing kexec..."
 sudo kexec -e

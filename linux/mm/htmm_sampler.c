@@ -27,17 +27,24 @@ static bool valid_va(unsigned long addr)
 static __u64 get_pebs_event(enum events e)
 {
 	switch (e) {
+	case L1_HIT:
+		return ICL_L1_HIT;
+	case L1_MISS:
+		return ICL_L1_MISS;
+	case L2_HIT:
+		return ICL_L2_HIT;
+	case L2_MISS:
+		return ICL_L2_MISS;
+	case L3_HIT:
+		return ICL_L3_HIT;
+	case L3_MISS:
+		return ICL_L3_MISS;
 	case DRAMREAD:
-		return DRAM_LLC_LOAD_MISS;
+		return ICL_LOCAL_DRAM;
 	case NVMREAD:
-		return NVM_LLC_LOAD_MISS;
+		return ICL_LOCAL_PMM;
 	case MEMWRITE:
-		return ALL_STORES;
-	case CXLREAD:
-		if (htmm_cxl_mode)
-			return REMOTE_DRAM_LLC_LOAD_MISS;
-		else
-			return N_HTMMEVENTS;
+		return ICL_ALL_STORES;
 	default:
 		return N_HTMMEVENTS;
 	}
@@ -56,10 +63,16 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 	attr.size = sizeof(struct perf_event_attr);
 	attr.config = config;
 	attr.config1 = config1;
-	if (config == ALL_STORES)
-		attr.sample_period = htmm_inst_sample_period;
-	else
-		attr.sample_period = get_sample_period(0);
+	// 三级采样周期：L1/WRITE 用十万级，L2 用五万，其他用百级
+	if (type == L1_HIT || type == L1_MISS || type == MEMWRITE) {
+		//attr.sample_period = get_sample_inst_period(0); // 100,003
+		attr.sample_period = 500000; // 100,003
+	} else if (type == L2_HIT || type == L2_MISS) {
+		attr.sample_period = L2_SAMPLE_PERIOD; // 50,000（固定）
+	} else {
+		//attr.sample_period = get_sample_period(0); // 199
+		attr.sample_period = 5000;
+	}
 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR |
 			   PERF_SAMPLE_TIME;
 	attr.disabled = 0;
@@ -169,15 +182,23 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 				continue;
 
 			switch (event) {
-			case DRAMREAD:
-			case NVMREAD:
-			case CXLREAD:
-				ret = perf_event_period(mem_event[cpu][event],
-							value);
-				break;
+			case L1_HIT:
+			case L1_MISS:
 			case MEMWRITE:
 				ret = perf_event_period(mem_event[cpu][event],
 							inst_value);
+				break;
+			case L2_HIT:
+			case L2_MISS:
+				// L2 固定周期 50000，不动态调整
+				ret = 0;
+				break;
+			case L3_HIT:
+			case L3_MISS:
+			case DRAMREAD:
+			case NVMREAD:
+				ret = perf_event_period(mem_event[cpu][event],
+							value);
 				break;
 			default:
 				ret = 0;
@@ -300,6 +321,9 @@ static int ksamplingd(void *data)
 
 						// ============================================================
 						// 🆕 新增：使用 trace_printk 记录 PEBS 采样
+						// Event 编号含义：
+						//   0=L1_HIT, 1=L1_MISS, 2=L2_HIT, 3=L2_MISS,
+						//   4=L3_HIT, 5=L3_MISS, 6=DRAMREAD, 7=NVMREAD, 8=MEMWRITE
 						// ============================================================
 
 						if (!valid_va(he->addr)) {
@@ -315,15 +339,17 @@ static int ksamplingd(void *data)
 						//count_vm_event(HTMM_NR_SAMPLED);
 						nr_sampled++;
 
+						// 暂时保持 DRAM/NVM 统计，L1/L2/L3 只计入 nr_sampled
 						if (event == DRAMREAD) {
 							nr_dram++;
 							hr_dram++;
-						} else if (event == CXLREAD ||
-							   event == NVMREAD) {
+						} else if (event == NVMREAD) {
 							nr_nvm++;
 							hr_nvm++;
-						} else
+						} else if (event == MEMWRITE) {
 							nr_write++;
+						}
+						// L1/L2/L3 事件暂不单独统计
 						break;
 					case PERF_RECORD_THROTTLE:
 					case PERF_RECORD_UNTHROTTLE:
