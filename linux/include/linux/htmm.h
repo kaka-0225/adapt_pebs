@@ -88,8 +88,8 @@ struct htmm_event {
 	struct perf_event_header header;
 	__u64 ip;
 	__u32 pid, tid;
-	__u64 addr;
-	__u64 time;
+	__u64 time; // 🔧 修复：与内核 perf_sample_data 的字段顺序匹配
+	__u64 addr; // time 和 addr 顺序颠倒了，导致读取错误的地址
 };
 
 enum events {
@@ -124,7 +124,8 @@ extern int set_page_coolstatus(struct page *page, pte_t *pte,
 
 extern void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres);
 
-extern void update_pginfo(pid_t pid, unsigned long address, enum events e);
+extern void update_pginfo(pid_t pid, unsigned long address, enum events e,
+			  u64 timestamp);
 
 extern bool deferred_split_huge_page_for_htmm(struct page *page);
 extern unsigned long
@@ -235,3 +236,7 @@ extern unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages);
 extern void kmigraterd_wakeup(int nid);
 extern int kmigraterd_init(void);
 extern void kmigraterd_stop(void);
+
+// Adaptive-PEBS: Welford 在线方差算法
+#define AP_SCALE_SHIFT 10 // 放大 1024 倍 (2^10)
+extern void update_page_fluctuation(pginfo_t *pinfo, u64 now);

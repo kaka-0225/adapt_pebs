@@ -127,6 +127,7 @@ fi
 FILE_SIZE=$(du -h "$LOGFILE" | cut -f1)
 TOTAL_LINES=$(wc -l < "$LOGFILE")
 PEBS_SAMPLES=$(grep -c "\[PEBS\]" "$LOGFILE" 2>/dev/null || echo "0")
+WELFORD_SAMPLES=$(grep -c "\[Welford-" "$LOGFILE" 2>/dev/null || echo "0")
 
 echo -e "${YELLOW}Log file:${NC}"
 echo -e "  ${BLUE}→${NC} Path: ${LOGFILE}"
@@ -134,8 +135,8 @@ echo -e "  ${BLUE}→${NC} Size: ${FILE_SIZE}"
 echo -e "  ${BLUE}→${NC} Total lines: ${TOTAL_LINES}"
 echo ""
 
-if [ "$PEBS_SAMPLES" -eq 0 ]; then
-    echo -e "${RED}✗ No PEBS samples found!${NC}"
+if [ "$PEBS_SAMPLES" -eq 0 ] && [ "$WELFORD_SAMPLES" -eq 0 ]; then
+    echo -e "${RED}✗ No PEBS or Welford samples found!${NC}"
     echo ""
     echo -e "${YELLOW}Possible reasons:${NC}"
     echo -e "  ${BLUE}1.${NC} Memtis not started (ksamplingd not running)"
@@ -147,19 +148,51 @@ if [ "$PEBS_SAMPLES" -eq 0 ]; then
     echo -e "  Check if ksamplingd is running: ${GREEN}ps aux | grep ksamplingd${NC}"
     echo -e "  View raw trace data: ${GREEN}cat $LOGFILE | head -20${NC}"
 else
-    echo -e "${GREEN}✓ PEBS Sampling Data:${NC}"
-    echo -e "  ${BLUE}→${NC} Total samples: ${PEBS_SAMPLES}"
+    echo -e "${GREEN}✓ Trace Data Captured:${NC}"
+    echo -e "  ${BLUE}→${NC} PEBS samples: ${PEBS_SAMPLES}"
+    echo -e "  ${BLUE}→${NC} Welford samples: ${WELFORD_SAMPLES}"
     
-    # 事件类型统计
-    DRAM_READ=$(grep -c "Event=0" "$LOGFILE" 2>/dev/null || echo "0")
-    NVM_READ=$(grep -c "Event=1" "$LOGFILE" 2>/dev/null || echo "0")
-    WRITE=$(grep -c "Event=2" "$LOGFILE" 2>/dev/null || echo "0")
+    if [ "$PEBS_SAMPLES" -gt 0 ]; then
+        # 事件类型统计（9个事件）
+        L1_HIT=$(grep -c "Event=0" "$LOGFILE" 2>/dev/null || echo "0")
+        L1_MISS=$(grep -c "Event=1" "$LOGFILE" 2>/dev/null || echo "0")
+        L2_HIT=$(grep -c "Event=2" "$LOGFILE" 2>/dev/null || echo "0")
+        L2_MISS=$(grep -c "Event=3" "$LOGFILE" 2>/dev/null || echo "0")
+        L3_HIT=$(grep -c "Event=4" "$LOGFILE" 2>/dev/null || echo "0")
+        L3_MISS=$(grep -c "Event=5" "$LOGFILE" 2>/dev/null || echo "0")
+        DRAM_READ=$(grep -c "Event=6" "$LOGFILE" 2>/dev/null || echo "0")
+        NVM_READ=$(grep -c "Event=7" "$LOGFILE" 2>/dev/null || echo "0")
+        WRITE=$(grep -c "Event=8" "$LOGFILE" 2>/dev/null || echo "0")
+        
+        echo ""
+        echo -e "${YELLOW}PEBS Event distribution (9 events):${NC}"
+        echo -e "  ${BLUE}→${NC} L1 HIT    (Event=0):  ${L1_HIT}"
+        echo -e "  ${BLUE}→${NC} L1 MISS   (Event=1):  ${L1_MISS}"
+        echo -e "  ${BLUE}→${NC} L2 HIT    (Event=2):  ${L2_HIT}"
+        echo -e "  ${BLUE}→${NC} L2 MISS   (Event=3):  ${L2_MISS}"
+        echo -e "  ${BLUE}→${NC} L3 HIT    (Event=4):  ${L3_HIT}"
+        echo -e "  ${BLUE}→${NC} L3 MISS   (Event=5):  ${L3_MISS}"
+        echo -e "  ${BLUE}→${NC} DRAM READ (Event=6):  ${DRAM_READ}"
+        echo -e "  ${BLUE}→${NC} NVM READ  (Event=7):  ${NVM_READ}"
+        echo -e "  ${BLUE}→${NC} WRITE     (Event=8):  ${WRITE}"
+    fi
     
-    echo ""
-    echo -e "${YELLOW}Event distribution:${NC}"
-    echo -e "  ${BLUE}→${NC} DRAM READ (Event=0):  ${DRAM_READ}"
-    echo -e "  ${BLUE}→${NC} NVM READ  (Event=1):  ${NVM_READ}"
-    echo -e "  ${BLUE}→${NC} WRITE     (Event=2):  ${WRITE}"
+    if [ "$WELFORD_SAMPLES" -gt 0 ]; then
+        # Welford 事件统计
+        WELFORD_INIT=$(grep -c "\[Welford-Init\]" "$LOGFILE" 2>/dev/null || echo "0")
+        WELFORD_INTERVAL=$(grep -c "\[Welford-Interval\]" "$LOGFILE" 2>/dev/null || echo "0")
+        WELFORD_SUMMARY=$(grep -c "\[Welford-Summary\]" "$LOGFILE" 2>/dev/null || echo "0")
+        WELFORD_DELTA1=$(grep -c "\[Welford-Delta1\]" "$LOGFILE" 2>/dev/null || echo "0")
+        WELFORD_DELTA2=$(grep -c "\[Welford-Delta2\]" "$LOGFILE" 2>/dev/null || echo "0")
+        
+        echo ""
+        echo -e "${YELLOW}Welford Algorithm Traces:${NC}"
+        echo -e "  ${BLUE}→${NC} Init events:      ${WELFORD_INIT}"
+        echo -e "  ${BLUE}→${NC} Interval logs:    ${WELFORD_INTERVAL}"
+        echo -e "  ${BLUE}→${NC} Summary logs:     ${WELFORD_SUMMARY}"
+        echo -e "  ${BLUE}→${NC} Delta1 logs:      ${WELFORD_DELTA1}"
+        echo -e "  ${BLUE}→${NC} Delta2 logs:      ${WELFORD_DELTA2}"
+    fi
     
     # CPU 分布（前 5 个）
     echo ""
@@ -188,6 +221,12 @@ echo -e "  grep PEBS $LOGFILE | sed -n 's/.*Addr=\\(0x[0-9a-f]*\\).*/\\1/p' | so
 echo ""
 echo -e "  ${GREEN}# Count samples per PID${NC}"
 echo -e "  grep PEBS $LOGFILE | sed -n 's/.*PID=\\([0-9]*\\).*/\\1/p' | sort | uniq -c | sort -rn"
+echo ""
+echo -e "  ${GREEN}# View Welford Summary logs (field analysis)${NC}"
+echo -e "  grep 'Welford-Summary' $LOGFILE | head -20"
+echo ""
+echo -e "  ${GREEN}# Check unique pages tracked by Welford${NC}"
+echo -e "  grep 'Welford-Summary' $LOGFILE | sed -n 's/.*pg=\\(0x[0-9a-f]*\\).*/\\1/p' | sort -u | wc -l"
 echo ""
 echo -e "${BLUE}=========================================${NC}"
 echo -e "${GREEN}✓ Logging complete!${NC}"

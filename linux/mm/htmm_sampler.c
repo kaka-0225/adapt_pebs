@@ -12,6 +12,10 @@
 #include "../kernel/events/internal.h"
 
 #include <linux/htmm.h>
+#include <linux/math64.h> // 新增：内核 64 位除法支持
+
+// Welford 算法的定点数缩放因子
+#define AP_SCALE_SHIFT 10 // 放大 1024 倍 (2^10)
 
 struct task_struct *access_sampling = NULL;
 struct perf_event ***mem_event;
@@ -211,6 +215,108 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 	}
 }
 
+/**
+ * Adaptive-PEBS: 更新页面的 Welford 在线方差（定点数版本）
+ * @pinfo: 目标页面的 pginfo 结构指针
+ * @now:   当前系统时间戳（来自 PERF_SAMPLE_TIME）
+ * 
+ * 算法说明：
+ *   Welford 在线方差算法用于计算访问间隔的抖动/波动性
+ *   mean_n = mean_{n-1} + (x - mean_{n-1}) / n
+ *   M2_n = M2_{n-1} + (x - mean_{n-1}) * (x - mean_n)
+ *   variance = M2 / n
+ * 
+ * 定点数处理：
+ *   所有间隔值放大 1024 倍（左移 10 位）以保留精度
+ * 
+ * trace_printk 埋点：
+ *   用于离线分析各字段的数值范围，判断位数是否合适
+ */
+void update_page_fluctuation(pginfo_t *pinfo, u64 now)
+{
+	u64 interval; // 原始间隔（未缩放，单位：纳秒或 TSC cycles）
+	u64 x_scaled; // 缩放后的间隔（1024 倍）
+	s64 delta, delta2; // Welford 算法的两个 delta
+	u32 n; // 样本计数
+
+	// ========== 第 1 步：冷启动处理 ==========
+	if (unlikely(pinfo->last_hit_time == 0)) {
+		pinfo->last_hit_time = now;
+		pinfo->adaptive_hit = 1;
+		pinfo->mean_interval = 0;
+		pinfo->fluctuation = 0;
+
+		// 【trace_printk】：记录首次采样
+		trace_printk("[Welford-Init] pg=%px, init_time=%llu\n", pinfo,
+			     now);
+		return;
+	}
+
+	// ========== 第 2 步：计算间隔并缩放 ==========
+	interval = now - pinfo->last_hit_time;
+	x_scaled = interval << AP_SCALE_SHIFT; // 放大 1024 倍
+
+	// 【trace_printk】：监控原始间隔值
+	// 用途：判断 u64 是否会溢出，观察间隔分布
+	trace_printk(
+		"[Welford-Interval] pg=%px, raw_interval=%llu, scaled=%llu\n",
+		pinfo, interval, x_scaled);
+
+	// ========== 第 3 步：更新时间戳 ==========
+	pinfo->last_hit_time = now;
+
+	// ========== 第 4 步：样本数递增 ==========
+	n = ++pinfo->adaptive_hit;
+
+	// 【trace_printk】：监控样本数，判断 u32 (42亿) 是否足够
+	// 每达到 2^20 (约 100 万) 的倍数时打印一次里程碑
+	if (unlikely((n & 0xFFFFF) == 0)) {
+		trace_printk(
+			"[Welford-Milestone] pg=%px, n=%u (every 1M samples)\n",
+			pinfo, n);
+	}
+
+	// ========== 第 5 步：Welford 方差计算 ==========
+
+	// 步骤 5.1：delta = x - mean_{n-1}
+	delta = (s64)x_scaled - (s64)pinfo->mean_interval;
+
+	// 【trace_printk】：监控 delta1 范围
+	// 用途：判断 s64 是否足够，观察是否有异常大的波动
+	trace_printk(
+		"[Welford-Delta1] pg=%px, delta=%lld, x_scaled=%llu, old_mean=%u\n",
+		pinfo, delta, x_scaled, pinfo->mean_interval);
+
+	// 步骤 5.2：mean_n = mean_{n-1} + delta / n
+	// 注意：必须使用 div_s64 进行 64 位有符号除法
+	pinfo->mean_interval += (u32)div_s64(delta, n);
+
+	// 步骤 5.3：delta2 = x - mean_n
+	delta2 = (s64)x_scaled - (s64)pinfo->mean_interval;
+
+	// 【trace_printk】：监控 delta2 范围
+	trace_printk("[Welford-Delta2] pg=%px, delta2=%lld, new_mean=%u\n",
+		     pinfo, delta2, pinfo->mean_interval);
+
+	// 步骤 5.4：M2_n = M2_{n-1} + delta * delta2
+	// 注意：delta * delta2 会放大到 1024*1024 = 2^20 倍
+	//       右移 AP_SCALE_SHIFT 恢复到 1024 倍精度
+	pinfo->fluctuation += (u64)((delta * delta2) >> AP_SCALE_SHIFT);
+
+	// ========== 【核心 trace_printk】：汇总所有字段数值 ==========
+	// 这是最重要的日志，用于离线分析各字段的位数是否合适
+	trace_printk(
+		"[Welford-Summary] pg=%px | n=%u | mean=%u | M2=%llu | var_approx=%llu | interval=%llu\n",
+		pinfo,
+		pinfo->adaptive_hit, // 样本数（u32，最大 ~42 亿）
+		pinfo->mean_interval, // 均值（u32，1024 倍缩放）
+		pinfo->fluctuation, // M2（u64，1024 倍缩放）
+		(pinfo->adaptive_hit > 1) ?
+			(pinfo->fluctuation / (pinfo->adaptive_hit - 1)) :
+			0, // 近似标准差²
+		interval); // 原始间隔（未缩放）
+}
+
 static int ksamplingd(void *data)
 {
 	unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0,
@@ -330,12 +436,12 @@ static int ksamplingd(void *data)
 							break;
 						}
 						trace_printk(
-							"[PEBS] CPU=%d Event=%d PID=%u TID=%u Addr=0x%lx IP=0x%llx Time=%llu\n",
+							"[PEBS] CPU=%d Event=%d PID=%u TID=%u Addr=0x%llx IP=0x%llx Time=%llu\n",
 							cpu, event, he->pid,
 							he->tid, he->addr,
 							he->ip, he->time);
 						update_pginfo(he->pid, he->addr,
-							      event);
+							      event, he->time);
 						//count_vm_event(HTMM_NR_SAMPLED);
 						nr_sampled++;
 
