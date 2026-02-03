@@ -88,8 +88,8 @@ struct htmm_event {
 	struct perf_event_header header;
 	__u64 ip;
 	__u32 pid, tid;
-	__u64 time; // 🔧 修复：与内核 perf_sample_data 的字段顺序匹配
-	__u64 addr; // time 和 addr 顺序颠倒了，导致读取错误的地址
+	__u64 time;
+	__u64 addr;
 };
 
 enum events {

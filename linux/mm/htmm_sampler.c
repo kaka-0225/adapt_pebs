@@ -253,6 +253,17 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	}
 
 	// ========== 第 2 步：计算间隔并缩放 ==========
+	// ⚠️ FIX: PEBS 时间戳可能乱序！忽略时间倒退的样本
+	if (unlikely(now <= pinfo->last_hit_time)) {
+		// 时间戳倒退或相等，完全跳过本次样本
+		trace_printk(
+			"[Welford-SKIP-TIME-REWIND] pg=%px, now=%llu <= last=%llu (delta=%lld)\n",
+			pinfo, now, pinfo->last_hit_time,
+			(s64)(now - pinfo->last_hit_time));
+		// 不更新 last_hit_time，不增加 adaptive_hit，完全忽略这个乱序样本
+		return;
+	}
+
 	interval = now - pinfo->last_hit_time;
 	x_scaled = interval << AP_SCALE_SHIFT; // 放大 1024 倍
 
@@ -284,18 +295,18 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	// 【trace_printk】：监控 delta1 范围
 	// 用途：判断 s64 是否足够，观察是否有异常大的波动
 	trace_printk(
-		"[Welford-Delta1] pg=%px, delta=%lld, x_scaled=%llu, old_mean=%u\n",
+		"[Welford-Delta1] pg=%px, delta=%lld, x_scaled=%llu, old_mean=%llu\n",
 		pinfo, delta, x_scaled, pinfo->mean_interval);
 
 	// 步骤 5.2：mean_n = mean_{n-1} + delta / n
 	// 注意：必须使用 div_s64 进行 64 位有符号除法
-	pinfo->mean_interval += (u32)div_s64(delta, n);
+	pinfo->mean_interval += (u64)div_s64(delta, n);
 
 	// 步骤 5.3：delta2 = x - mean_n
 	delta2 = (s64)x_scaled - (s64)pinfo->mean_interval;
 
 	// 【trace_printk】：监控 delta2 范围
-	trace_printk("[Welford-Delta2] pg=%px, delta2=%lld, new_mean=%u\n",
+	trace_printk("[Welford-Delta2] pg=%px, delta2=%lld, new_mean=%llu\n",
 		     pinfo, delta2, pinfo->mean_interval);
 
 	// 步骤 5.4：M2_n = M2_{n-1} + delta * delta2
@@ -306,10 +317,10 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	// ========== 【核心 trace_printk】：汇总所有字段数值 ==========
 	// 这是最重要的日志，用于离线分析各字段的位数是否合适
 	trace_printk(
-		"[Welford-Summary] pg=%px | n=%u | mean=%u | M2=%llu | var_approx=%llu | interval=%llu\n",
+		"[Welford-Summary] pg=%px | n=%u | mean=%llu | M2=%llu | var_approx=%llu | interval=%llu\n",
 		pinfo,
 		pinfo->adaptive_hit, // 样本数（u32，最大 ~42 亿）
-		pinfo->mean_interval, // 均值（u32，1024 倍缩放）
+		pinfo->mean_interval, // 均值（u64，1024 倍缩放）
 		pinfo->fluctuation, // M2（u64，1024 倍缩放）
 		(pinfo->adaptive_hit > 1) ?
 			(pinfo->fluctuation / (pinfo->adaptive_hit - 1)) :

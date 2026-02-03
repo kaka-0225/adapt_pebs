@@ -1346,73 +1346,53 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e,
 	struct mem_cgroup *memcg;
 	int ret;
 
-	//trace_printk(
-	//	"[Welford-!!!debug:update_pginfo-ENTER]"); // 🔍 DEBUG: 进入函数
-
 	if (htmm_mode == HTMM_NO_MIG) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-HTMM_NO_MIG]"); // 🔍 DEBUG: HTMM_NO_MIG 模式过滤
 		goto put_task;
 	}
 
 	if (!mm) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-NO_MM]"); // 🔍 DEBUG: mm 为空过滤
 		goto put_task;
 	}
 
 	if (!mmap_read_trylock(mm)) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-LOCK_FAIL]"); // 🔍 DEBUG: mmap 锁获取失败过滤
 		goto put_task;
 	}
 
 	vma = find_vma(mm, address);
 	if (unlikely(!vma)) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-NO_VMA]"); // 🔍 DEBUG: VMA 不存在过滤
 		goto mmap_unlock;
 	}
-
-	// � DEBUG: 打印 VMA 详细信息用于诊断
-	trace_printk(
-		"[Welford-!!!debug:VMA-INFO] addr=0x%lx start=0x%lx end=0x%lx flags=0x%lx file=%p",
-		address, vma->vm_start, vma->vm_end, vma->vm_flags,
-		vma->vm_file);
 
 	// FIX: 检查地址是否真正在VMA范围内
 	// find_vma() 返回第一个 vm_end > address 的VMA，但不保证 address >= vm_start
 	if (address < vma->vm_start) {
-		trace_printk(
+		/*trace_printk(
 			"[Welford-!!!debug:FILTER-ADDR_BEFORE_VMA] addr=0x%lx < start=0x%lx",
-			address, vma->vm_start);
+			address, vma->vm_start);*/
 		goto mmap_unlock;
 	}
 
-	// 🔧 修改：放宽 VMA 检查，允许匿名可写页面（堆/栈/数据段）
-	// 原条件过滤了 99.99% 的采样（主要是代码段访问）
-	// 新条件：只过滤设备映射和只读文件映射（代码段）
 	if (!vma->vm_mm || !vma_migratable(vma)) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-VMA_NOT_MIGRATABLE]"); // 🔍 DEBUG: VMA 不可迁移过滤（设备映射/巨页）
+		//trace_printk(
+		//	"[Welford-!!!debug:FILTER-VMA_NOT_MIGRATABLE]"); // 🔍 DEBUG: VMA 不可迁移过滤（设备映射/巨页）
 		goto mmap_unlock;
 	}
 
 	// 过滤只读文件映射（代码段、.rodata），但保留匿名页和可写文件映射
 	if (vma->vm_file && !(vma->vm_flags & VM_WRITE)) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-VMA_READONLY_FILE]"); // 🔍 DEBUG: 只读文件映射过滤（代码段/.rodata）
+		//trace_printk(
+		//	"[Welford-!!!debug:FILTER-VMA_READONLY_FILE]"); // 🔍 DEBUG: 只读文件映射过滤（代码段/.rodata）
 		goto mmap_unlock;
 	}
 
 	// 🔍 DEBUG: VMA检查全部通过
-	trace_printk("[Welford-!!!debug:VMA-PASSED] addr=0x%lx flags=0x%lx",
-		     address, vma->vm_flags);
+	//trace_printk("[Welford-!!!debug:VMA-PASSED] addr=0x%lx flags=0x%lx",
+	//	     address, vma->vm_flags);
 
 	memcg = get_mem_cgroup_from_mm(mm);
 	if (!memcg || !memcg->htmm_enabled) {
-		trace_printk(
-			"[Welford-!!!debug:FILTER-MEMCG_DISABLED]"); // 🔍 DEBUG: memcg 未启用过滤
+		//trace_printk(
+		//	"[Welford-!!!debug:FILTER-MEMCG_DISABLED]"); // 🔍 DEBUG: memcg 未启用过滤
 		goto mmap_unlock;
 	}
 

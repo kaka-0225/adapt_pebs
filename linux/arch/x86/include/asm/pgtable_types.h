@@ -294,7 +294,7 @@ typedef struct {
 	// --- Adaptive-PEBS 新增字段（Welford 在线方差） ---
 	u64 last_hit_time; // 上次采样时间戳（PERF_SAMPLE_TIME）
 	u32 adaptive_hit; // 样本总数 n
-	u32 mean_interval; // 间隔均值（放大 1024 倍）
+	u64 mean_interval; // 间隔均值（放大 1024 倍，u64避免溢出）
 	u64 fluctuation; // 聚合方差 M2（放大 1024 倍）
 } pginfo_t;
 #endif
