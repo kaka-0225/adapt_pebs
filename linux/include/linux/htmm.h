@@ -240,3 +240,7 @@ extern void kmigraterd_stop(void);
 // Adaptive-PEBS: Welford 在线方差算法
 #define AP_SCALE_SHIFT 10 // 放大 1024 倍 (2^10)
 extern void update_page_fluctuation(pginfo_t *pinfo, u64 now);
+extern void update_event_heap_from_sample(int event_id, pginfo_t *pinfo);
+
+// Phase 3.1: 自适应指标系统 - 开销计数器
+extern atomic64_t event_sample_counts[9];

@@ -857,14 +857,23 @@ lru_unlock:
 }
 
 static void update_base_page(struct vm_area_struct *vma, struct page *page,
-			     pginfo_t *pginfo, u64 timestamp)
+			     pginfo_t *pginfo, u64 timestamp, int event_id)
 {
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
 	unsigned long prev_accessed, prev_idx, cur_idx;
 	bool hot;
 
+	// 🆕 Phase 3.1: 统计Event采样开销
+	if (event_id >= 0 && event_id < 9) {
+		extern atomic64_t event_sample_counts[9];
+		atomic64_inc(&event_sample_counts[event_id]);
+	}
+
 	// 🆕 Adaptive-PEBS: 更新 Welford 在线方差
 	update_page_fluctuation(pginfo, timestamp);
+
+	// 🆕 Adaptive-PEBS: 更新全局Event堆
+	update_event_heap_from_sample(event_id, pginfo);
 
 	/* check cooling status and perform cooling if the page needs to be cooled */
 	check_base_cooling(pginfo, page, false);
@@ -988,7 +997,8 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 }
 
 static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
-			       unsigned long address, u64 timestamp)
+			       unsigned long address, u64 timestamp,
+			       int event_id)
 {
 	pte_t *pte, ptent;
 	spinlock_t *ptl;
@@ -1016,7 +1026,7 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
 	if (!pginfo)
 		goto pte_unlock;
 
-	update_base_page(vma, page, pginfo, timestamp);
+	update_base_page(vma, page, pginfo, timestamp, event_id);
 	pte_unmap_unlock(pte, ptl);
 	if (htmm_cxl_mode) {
 		if (page_to_nid(page) == 0)
@@ -1036,7 +1046,8 @@ pte_unlock:
 }
 
 static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
-			       unsigned long address, u64 timestamp)
+			       unsigned long address, u64 timestamp,
+			       int event_id)
 {
 	pmd_t *pmd, pmdval;
 	bool ret = 0;
@@ -1086,11 +1097,11 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 	}
 
 	/* base page */
-	return __update_pte_pginfo(vma, pmd, address, timestamp);
+	return __update_pte_pginfo(vma, pmd, address, timestamp, event_id);
 }
 
 static int __update_pginfo(struct vm_area_struct *vma, unsigned long address,
-			   u64 timestamp)
+			   u64 timestamp, int event_id)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -1108,7 +1119,7 @@ static int __update_pginfo(struct vm_area_struct *vma, unsigned long address,
 	if (pud_none_or_clear_bad(pud))
 		return 0;
 
-	return __update_pmd_pginfo(vma, pud, address, timestamp);
+	return __update_pmd_pginfo(vma, pud, address, timestamp, event_id);
 }
 
 static void set_memcg_split_thres(struct mem_cgroup *memcg)
@@ -1397,7 +1408,7 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e,
 	}
 
 	/* increase sample counts only for valid records */
-	ret = __update_pginfo(vma, address, timestamp);
+	ret = __update_pginfo(vma, address, timestamp, e);
 	if (ret == 1) { /* memory accesses to DRAM */
 		memcg->nr_sampled++;
 		memcg->nr_sampled_for_split++;

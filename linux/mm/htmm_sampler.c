@@ -17,6 +17,145 @@
 // Welford 算法的定点数缩放因子
 #define AP_SCALE_SHIFT 10 // 放大 1024 倍 (2^10)
 
+// ============================================================================
+// Phase 1: Adaptive-PEBS 堆数据结构
+// ============================================================================
+
+/**
+ * heap_entry - 堆中的元素
+ * @pinfo: 指向Page的pginfo，用于获取Welford方差数据
+ * @event_hit_count: 该Event采样该Page的次数（最小堆的Key）
+ */
+struct heap_entry {
+	pginfo_t *pinfo;
+	u32 event_hit_count;
+};
+
+/**
+ * event_heap - 最小堆结构，每个Event类型维护一个
+ * @entries: 动态分配的堆元素数组
+ * @size: 当前堆中的元素数量
+ * @capacity: 堆的最大容量（默认1000）
+ * @lock: 自旋锁，保护堆的并发访问
+ */
+struct event_heap {
+	struct heap_entry *entries;
+	u32 size;
+	u32 capacity;
+	spinlock_t lock;
+};
+
+/**
+ * event_type - Event类型枚举（对应9种PEBS事件）
+ */
+enum event_type {
+	EVENT_L1_HIT = 0,
+	EVENT_L1_MISS,
+	EVENT_L2_HIT,
+	EVENT_L2_MISS,
+	EVENT_L3_HIT,
+	EVENT_L3_MISS,
+	EVENT_DRAM_READ,
+	EVENT_NVM_READ,
+	EVENT_MEM_WRITE,
+	EVENT_TYPE_MAX = 9
+};
+
+// 全局堆数组：9个Event各维护一个最小堆
+static struct event_heap global_event_heaps[EVENT_TYPE_MAX];
+
+// 堆容量配置（后续可通过sysfs调整）
+static u32 heap_capacity = 1000;
+
+// ============================================================================
+// Phase 3.1: 自适应公式数据结构（Adaptive Metrics）
+// ============================================================================
+
+// 定点数精度：所有分数放大10000倍（0-10000表示0%-100%）
+#define ADAPTIVE_SCALE 10000
+
+// 三个维度的归一化上限
+#define FLUC_MAX                                                               \
+	20000000000000000ULL // 2×10^16，波动性上限（覆盖P99: 1.84×10^19）
+#define HIT_MAX 100 // 热度阈值（event_hit_count平均值上限）
+#define OVERHEAD_MAX 10000 // 开销阈值（sample_count上限）
+
+// 权重系数（定点数表示）
+static const s32 WEIGHT_VIBRATE = 4000; // 0.40 * ADAPTIVE_SCALE = 40%
+static const s32 WEIGHT_HOTNESS = 5000; // 0.50 * ADAPTIVE_SCALE = 50%
+static const s32 WEIGHT_OVERHEAD =
+	-1000; // -0.10 * ADAPTIVE_SCALE = -10%（负向惩罚）
+
+// 全局开销计数器：统计每个Event的采样次数（用于V_overhead计算）
+// Phase 3.1: 去掉 static 使 mm/htmm_core.c 可以访问
+atomic64_t event_sample_counts[EVENT_TYPE_MAX];
+
+// 每个Event的自适应指标
+struct adaptive_metrics {
+	u32 vibrate_score; // 波动性分数 [0, 10000]
+	u32 hotness_score; // 热度分数 [0, 10000]
+	u32 overhead_score; // 开销分数 [0, 10000]
+	s32 V_raw; // 原始综合分数（可能为负）
+	u32 V_normalized; // 归一化分数 [0, 10000]
+	
+	// Phase 3.2 新增字段：Period自适应更新
+	u64 target_period;  // 目标Period（从V_norm映射得到）
+	u64 current_period; // 当前Period（从硬件读取）
+	u64 new_period;     // EMA平滑后的新Period
+};
+
+// 全局自适应指标数组（9个Event）
+static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
+
+// ============================================================================
+// Phase 3.2: Period自适应更新配置
+// ============================================================================
+
+// EMA平滑系数（α = 0.3）
+#define EMA_ALPHA_NUM   3      // 分子
+#define EMA_ALPHA_DEN   10     // 分母，α = 3/10 = 0.3
+
+// Period范围
+#define MIN_PERIOD      2000ULL    // 最高采样频率（2000个事件采样1次）
+#define MAX_PERIOD      200000ULL  // 最低采样频率（200000个事件采样1次）
+
+// 全局开销预算
+#define GLOBAL_OVERHEAD_BUDGET 50000  // 每10秒最多采样50000次
+
+// 更新周期
+#define ADAPTIVE_UPDATE_INTERVAL_SEC 10  // 10秒
+
+// 定时器
+static struct delayed_work adaptive_update_work;
+static bool adaptive_timer_running = false;
+
+// ============================================================================
+// 函数前向声明
+// ============================================================================
+static int heap_init(struct event_heap *heap, u32 capacity);
+static void heap_destroy(struct event_heap *heap);
+static void heap_sift_up(struct event_heap *heap, u32 idx);
+static void heap_sift_down(struct event_heap *heap, u32 idx);
+static int heap_find(struct event_heap *heap, pginfo_t *pinfo);
+static void pebs_disable(void);
+
+// Phase 3.1: 自适应公式函数声明
+static u32 calculate_vibrate_score(enum event_type type);
+static u32 calculate_hotness_score(enum event_type type);
+static u32 calculate_overhead_score(enum event_type type);
+static void calculate_adaptive_metrics(void);
+static void adaptive_metrics_init(void);
+
+// Phase 3.2: Period自适应更新函数声明
+static u64 map_score_to_period(u32 v_normalized);
+static u64 apply_ema_to_period(u64 current_period, u64 target_period);
+static u64 get_current_period(enum event_type type);
+static void update_pebs_event_period(enum event_type type, u64 new_period);
+static void apply_global_overhead_control(void);
+static void adaptive_update_work_handler(struct work_struct *work);
+static void adaptive_timer_init(void);
+static void adaptive_timer_stop(void);
+
 struct task_struct *access_sampling = NULL;
 struct perf_event ***mem_event;
 
@@ -138,6 +277,53 @@ static int pebs_init(pid_t pid, int node)
 		}
 	}
 
+	// ============================================================================
+	// Phase 1: 初始化Event堆
+	// ============================================================================
+	trace_printk("[Heap-Init] Initializing %d event heaps, capacity=%u\n",
+		     EVENT_TYPE_MAX, heap_capacity);
+
+	for (event = 0; event < EVENT_TYPE_MAX; event++) {
+		int ret = heap_init(&global_event_heaps[event], heap_capacity);
+		if (ret) {
+			trace_printk(
+				"[Heap-ERROR] Failed to init heap for event %d, ret=%d\n",
+				event, ret);
+
+			// 清理已创建的堆
+			while (--event >= 0)
+				heap_destroy(&global_event_heaps[event]);
+
+			// 清理PEBS资源
+			pebs_disable();
+			return ret;
+		}
+
+		trace_printk(
+			"[Heap-Init] Event %d (%s) heap created, capacity=%u\n",
+			event,
+			event == EVENT_L1_HIT	 ? "L1_HIT" :
+			event == EVENT_L1_MISS	 ? "L1_MISS" :
+			event == EVENT_L2_HIT	 ? "L2_HIT" :
+			event == EVENT_L2_MISS	 ? "L2_MISS" :
+			event == EVENT_L3_HIT	 ? "L3_HIT" :
+			event == EVENT_L3_MISS	 ? "L3_MISS" :
+			event == EVENT_DRAM_READ ? "DRAM_READ" :
+			event == EVENT_NVM_READ	 ? "NVM_READ" :
+			event == EVENT_MEM_WRITE ? "MEM_WRITE" :
+						   "UNKNOWN",
+			heap_capacity);
+	}
+
+	trace_printk(
+		"[Heap-Init] All %d event heaps initialized successfully\n",
+		EVENT_TYPE_MAX);
+
+	// ============================================================================
+	// Phase 3.1: 初始化自适应指标系统
+	// ============================================================================
+	adaptive_metrics_init();
+
 	return 0;
 }
 
@@ -160,6 +346,42 @@ static void pebs_disable(void)
 				perf_event_disable(mem_event[cpu][event]);
 		}
 	}
+
+	// ============================================================================
+	// Phase 3.1: 验证自适应指标计算（销毁堆前）
+	// ============================================================================
+	trace_printk(
+		"[Adaptive-Trigger] Calculating metrics before heap destruction\n");
+	calculate_adaptive_metrics();
+
+	// ============================================================================
+	// Phase 1: 清理Event堆
+	// ============================================================================
+	trace_printk("[Heap-Destroy] Destroying %d event heaps\n",
+		     EVENT_TYPE_MAX);
+
+	for (event = 0; event < EVENT_TYPE_MAX; event++) {
+		struct event_heap *heap = &global_event_heaps[event];
+
+		trace_printk(
+			"[Heap-Destroy] Event %d (%s) heap destroyed, final_size=%u\n",
+			event,
+			event == EVENT_L1_HIT	 ? "L1_HIT" :
+			event == EVENT_L1_MISS	 ? "L1_MISS" :
+			event == EVENT_L2_HIT	 ? "L2_HIT" :
+			event == EVENT_L2_MISS	 ? "L2_MISS" :
+			event == EVENT_L3_HIT	 ? "L3_HIT" :
+			event == EVENT_L3_MISS	 ? "L3_MISS" :
+			event == EVENT_DRAM_READ ? "DRAM_READ" :
+			event == EVENT_NVM_READ	 ? "NVM_READ" :
+			event == EVENT_MEM_WRITE ? "MEM_WRITE" :
+						   "UNKNOWN",
+			heap->size);
+
+		heap_destroy(heap);
+	}
+
+	trace_printk("[Heap-Destroy] All event heaps destroyed\n");
 }
 
 static void pebs_enable(void)
@@ -603,6 +825,503 @@ static int ksamplingd_run(void)
 		}
 	}
 	return err;
+}
+
+// ============================================================================
+// Phase 1: 堆操作函数
+// ============================================================================
+
+/**
+ * heap_init - 初始化一个事件堆
+ * @heap: 要初始化的堆结构
+ * @capacity: 堆的最大容量
+ *
+ * 返回: 0表示成功，负数表示失败
+ */
+static int heap_init(struct event_heap *heap, u32 capacity)
+{
+	heap->entries =
+		kmalloc_array(capacity, sizeof(struct heap_entry), GFP_KERNEL);
+	if (!heap->entries) {
+		trace_printk("[Heap-ERROR] Failed to allocate %u entries\n",
+			     capacity);
+		return -ENOMEM;
+	}
+
+	heap->size = 0;
+	heap->capacity = capacity;
+	spin_lock_init(&heap->lock);
+
+	return 0;
+}
+
+/**
+ * heap_destroy - 销毁一个事件堆，释放内存
+ * @heap: 要销毁的堆结构
+ */
+static void heap_destroy(struct event_heap *heap)
+{
+	if (heap->entries) {
+		kfree(heap->entries);
+		heap->entries = NULL;
+	}
+	heap->size = 0;
+}
+
+/**
+ * heap_sift_up - 堆的向上调整（用于插入或增加计数后维护堆性质）
+ * @heap: 目标堆
+ * @idx: 需要调整的元素索引
+ *
+ * 最小堆性质：父节点的event_hit_count <= 子节点的event_hit_count
+ */
+static void heap_sift_up(struct event_heap *heap, u32 idx)
+{
+	struct heap_entry temp;
+	u32 parent;
+
+	while (idx > 0) {
+		parent = (idx - 1) / 2;
+
+		// 如果当前节点 >= 父节点，堆性质已满足
+		if (heap->entries[idx].event_hit_count >=
+		    heap->entries[parent].event_hit_count)
+			break;
+
+		// 交换父子节点
+		temp = heap->entries[idx];
+		heap->entries[idx] = heap->entries[parent];
+		heap->entries[parent] = temp;
+
+		idx = parent;
+	}
+}
+
+/**
+ * heap_sift_down - 堆的向下调整（用于替换堆顶后维护堆性质）
+ * @heap: 目标堆
+ * @idx: 需要调整的元素索引
+ */
+static void heap_sift_down(struct event_heap *heap, u32 idx)
+{
+	struct heap_entry temp;
+	u32 child, right;
+
+	while ((child = 2 * idx + 1) < heap->size) {
+		right = child + 1;
+
+		// 选择较小的子节点
+		if (right < heap->size &&
+		    heap->entries[right].event_hit_count <
+			    heap->entries[child].event_hit_count) {
+			child = right;
+		}
+
+		// 如果当前节点 <= 子节点，堆性质已满足
+		if (heap->entries[idx].event_hit_count <=
+		    heap->entries[child].event_hit_count)
+			break;
+
+		// 交换父子节点
+		temp = heap->entries[idx];
+		heap->entries[idx] = heap->entries[child];
+		heap->entries[child] = temp;
+
+		idx = child;
+	}
+}
+
+/**
+ * heap_find - 在堆中查找指定Page
+ * @heap: 目标堆
+ * @pinfo: 要查找的Page的pginfo指针
+ *
+ * 返回: 元素索引（>=0）或-1（未找到）
+ * 注意: O(n)复杂度，Phase 2中可优化为哈希表加速
+ */
+static int heap_find(struct event_heap *heap, pginfo_t *pinfo)
+{
+	u32 i;
+
+	for (i = 0; i < heap->size; i++) {
+		if (heap->entries[i].pinfo == pinfo)
+			return i;
+	}
+
+	return -1;
+}
+
+// 🆕 Adaptive-PEBS: 从event_id获取event_type枚举
+static enum event_type get_event_type_from_id(int event_id)
+{
+	switch (event_id) {
+	case 0:
+		return EVENT_L1_HIT;
+	case 1:
+		return EVENT_L1_MISS;
+	case 2:
+		return EVENT_L2_HIT;
+	case 3:
+		return EVENT_L2_MISS;
+	case 4:
+		return EVENT_L3_HIT;
+	case 5:
+		return EVENT_L3_MISS;
+	case 6:
+		return EVENT_DRAM_READ;
+	case 7:
+		return EVENT_NVM_READ;
+	case 8:
+		return EVENT_MEM_WRITE;
+	default:
+		return EVENT_L1_HIT; // Fallback
+	}
+}
+
+// 🆕 Adaptive-PEBS: 堆的更新或插入逻辑
+static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
+{
+	int idx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&heap->lock, flags);
+
+	// 情况1: Page已在堆中 → 增加hit_count
+	idx = heap_find(heap, pinfo);
+	if (idx >= 0) {
+		heap->entries[idx].event_hit_count++;
+		heap_sift_up(heap, idx); // 重新排序
+		trace_printk("[Heap-Update] pinfo=%p new_hit=%u\n", pinfo,
+			     heap->entries[idx].event_hit_count);
+		spin_unlock_irqrestore(&heap->lock, flags);
+		return;
+	}
+
+	// 情况2: 堆未满 → 直接插入
+	if (heap->size < heap->capacity) {
+		heap->entries[heap->size].pinfo = pinfo;
+		heap->entries[heap->size].event_hit_count = 1;
+		heap_sift_up(heap, heap->size);
+		heap->size++;
+		trace_printk("[Heap-Insert] pinfo=%p heap_size=%d\n", pinfo,
+			     heap->size);
+		spin_unlock_irqrestore(&heap->lock, flags);
+		return;
+	}
+
+	// 情况3: 堆已满 → 检查是否替换堆顶
+	if (heap->entries[0].event_hit_count < 1) {
+		// 只替换hit_count<1的堆顶（冷页）
+		heap->entries[0].pinfo = pinfo;
+		heap->entries[0].event_hit_count = 1;
+		heap_sift_down(heap, 0);
+		trace_printk("[Heap-Replace] pinfo=%p (evict cold top)\n",
+			     pinfo);
+	} else {
+		// 堆顶已是热页，新Page优先级不够，丢弃
+		trace_printk(
+			"[Heap-Discard] pinfo=%p (heap full, top_hit=%u)\n",
+			pinfo, heap->entries[0].event_hit_count);
+	}
+
+	spin_unlock_irqrestore(&heap->lock, flags);
+}
+
+// 🆕 Adaptive-PEBS: 从PEBS采样更新堆（被htmm_core.c调用）
+void update_event_heap_from_sample(int event_id, pginfo_t *pinfo)
+{
+	if (event_id < 0 || event_id >= EVENT_TYPE_MAX) {
+		trace_printk("[Heap-Error] Invalid event_id=%d\n", event_id);
+		return;
+	}
+
+	heap_update_or_insert(&global_event_heaps[event_id], pinfo);
+}
+
+// ============================================================================
+// Phase 3.1: 自适应公式计算函数
+// ============================================================================
+
+/**
+ * calculate_vibrate_score - 计算波动性分数（基于Welford方差）
+ * @type: Event类型
+ * 
+ * 算法：
+ * 1. 遍历堆中所有页面，累加fluctuation
+ * 2. 计算平均波动值 avg_fluc = sum / count
+ * 3. 归一化：score = min(avg_fluc * ADAPTIVE_SCALE / FLUC_MAX, ADAPTIVE_SCALE)
+ * 
+ * 返回：波动性分数 [0, 10000]
+ */
+static u32 calculate_vibrate_score(enum event_type type)
+{
+	struct event_heap *heap = &global_event_heaps[type];
+	u64 sum_fluctuation = 0;
+	u32 count = 0;
+	u32 i;
+	u64 avg_fluc;
+	u64 score;
+
+	if (!heap || heap->size == 0) {
+		return 0; // 空堆返回0分
+	}
+
+	// 遍历堆中所有页面，累加fluctuation
+	for (i = 0; i < heap->size; i++) {
+		struct heap_entry *entry = &heap->entries[i];
+		pginfo_t *pinfo = entry->pinfo;
+		if (pinfo) {
+			sum_fluctuation += pinfo->fluctuation;
+			count++;
+		}
+	}
+
+	if (count == 0) {
+		return 0;
+	}
+
+	// 计算平均波动值
+	avg_fluc = sum_fluctuation / count;
+
+	// 归一化到 [0, ADAPTIVE_SCALE]
+	// score = min(avg_fluc * ADAPTIVE_SCALE / FLUC_MAX, ADAPTIVE_SCALE)
+	if (avg_fluc >= FLUC_MAX) {
+		score = ADAPTIVE_SCALE;
+	} else {
+		score = (avg_fluc * ADAPTIVE_SCALE) / FLUC_MAX;
+	}
+
+	return (u32)score;
+}
+
+/**
+ * calculate_hotness_score - 计算热度分数（基于hit_count + 堆密度）
+ * @type: Event类型
+ * 
+ * 算法：
+ * 1. 遍历堆中所有页面，累加event_hit_count
+ * 2. 计算平均热度 avg_hit = sum / count
+ * 3. 计算堆密度加成 density_bonus = (heap->size * 100) / heap->capacity
+ *    - 堆越满，说明热页越多，加成越大（0-100分）
+ * 4. 基础分数：base_score = min(avg_hit * ADAPTIVE_SCALE / HIT_MAX, ADAPTIVE_SCALE)
+ * 5. 最终分数：score = base_score + density_bonus（上限ADAPTIVE_SCALE）
+ * 
+ * 返回：热度分数 [0, 10000]
+ */
+static u32 calculate_hotness_score(enum event_type type)
+{
+	struct event_heap *heap = &global_event_heaps[type];
+	u64 sum_hit_count = 0;
+	u32 count = 0;
+	u32 i;
+	u64 avg_hit;
+	u32 base_score;
+	u32 density_bonus;
+	u32 final_score;
+
+	if (!heap || heap->size == 0) {
+		return 0; // 空堆返回0分
+	}
+
+	// 遍历堆中所有页面，累加hit_count
+	for (i = 0; i < heap->size; i++) {
+		struct heap_entry *entry = &heap->entries[i];
+		sum_hit_count += entry->event_hit_count;
+		count++;
+	}
+
+	if (count == 0) {
+		return 0;
+	}
+
+	// 计算平均热度
+	avg_hit = sum_hit_count / count;
+
+	// 基础分数：归一化到 [0, ADAPTIVE_SCALE]
+	if (avg_hit >= HIT_MAX) {
+		base_score = ADAPTIVE_SCALE;
+	} else {
+		base_score = (u32)((avg_hit * ADAPTIVE_SCALE) / HIT_MAX);
+	}
+
+	// 堆密度加成：堆越满，热页越多（0-100分）
+	// density_bonus = (heap->size * 100) / heap->capacity
+	if (heap->capacity > 0) {
+		density_bonus = (heap->size * 100) / heap->capacity;
+	} else {
+		density_bonus = 0;
+	}
+
+	// 最终分数 = 基础分数 + 密度加成（上限10000）
+	final_score = base_score + density_bonus;
+	if (final_score > ADAPTIVE_SCALE) {
+		final_score = ADAPTIVE_SCALE;
+	}
+
+	return final_score;
+}
+
+/**
+ * calculate_overhead_score - 计算开销分数（基于采样计数）
+ * @type: Event类型
+ * 
+ * 算法：
+ * 1. 读取event_sample_counts[type]（每次update_base_page时递增）
+ * 2. 归一化：score = min(count * ADAPTIVE_SCALE / OVERHEAD_MAX, ADAPTIVE_SCALE)
+ * 3. 注意：这是负向指标，最终会乘以负权重
+ * 
+ * 返回：开销分数 [0, 10000]
+ */
+static u32 calculate_overhead_score(enum event_type type)
+{
+	u64 sample_count;
+	u64 score;
+
+	// 读取采样计数
+	sample_count = atomic64_read(&event_sample_counts[type]);
+
+	// 归一化到 [0, ADAPTIVE_SCALE]
+	if (sample_count >= OVERHEAD_MAX) {
+		score = ADAPTIVE_SCALE;
+	} else {
+		score = (sample_count * ADAPTIVE_SCALE) / OVERHEAD_MAX;
+	}
+
+	return (u32)score;
+}
+
+/**
+ * calculate_adaptive_metrics - 综合计算所有Event的自适应分数
+ * 
+ * Phase 3.1功能：计算三维度分数并归一化到[0,10000]
+ * Phase 3.2会在delayed_work中周期性调用此函数，根据分数更新Period
+ * 
+ * 算法：
+ * 1. 遍历9个Event，分别计算三个维度分数
+ * 2. 计算原始分数：V_raw = β·V_vibrate + γ·V_hotness + δ·V_overhead
+ * 3. 归一化到[0, ADAPTIVE_SCALE]：
+ *    - V_min = -1000 (最差情况：振动0，热度0，开销满10000)
+ *    - V_max = 9000 (最好情况：振动满10000，热度满10000，开销0)
+ *    - V_normalized = (V_raw - V_min) * ADAPTIVE_SCALE / (V_max - V_min)
+ * 4. 通过trace_printk输出每个Event的分数（Phase 3.1验证用）
+ */
+static void calculate_adaptive_metrics(void)
+{
+	enum event_type type;
+	s32 V_min = -1000; // 最小可能分数 = 0*4000 + 0*5000 + 10000*(-1000)
+	s32 V_max =
+		9000; // 最大可能分数 = 10000*4000 + 10000*5000 + 0*(-1000) = 90000000 / 10000 = 9000
+	s32 V_range = V_max - V_min; // 10000
+
+	trace_printk(
+		"[Adaptive-Start] ===== Calculate Adaptive Metrics =====\n");
+
+	for (type = 0; type < EVENT_TYPE_MAX; type++) {
+		struct adaptive_metrics *metrics =
+			&global_adaptive_metrics[type];
+		u32 vibrate, hotness, overhead;
+		s64 V_raw_calc;
+		s32 V_raw;
+		s64 V_norm_calc;
+
+		// Step 1: 计算三个维度分数
+		vibrate = calculate_vibrate_score(type);
+		hotness = calculate_hotness_score(type);
+		overhead = calculate_overhead_score(type);
+
+		// 保存到metrics结构
+		metrics->vibrate_score = vibrate;
+		metrics->hotness_score = hotness;
+		metrics->overhead_score = overhead;
+
+		// Step 2: 计算原始综合分数（定点数运算）
+		// V_raw = (β·V_vibrate + γ·V_hotness + δ·V_overhead) / ADAPTIVE_SCALE
+		// 注意：WEIGHT_OVERHEAD是负数
+		V_raw_calc = ((s64)WEIGHT_VIBRATE * vibrate +
+			      (s64)WEIGHT_HOTNESS * hotness +
+			      (s64)WEIGHT_OVERHEAD * overhead) /
+			     ADAPTIVE_SCALE;
+		V_raw = (s32)V_raw_calc;
+		metrics->V_raw = V_raw;
+
+		// Step 3: 归一化到[0, ADAPTIVE_SCALE]
+		// V_normalized = (V_raw - V_min) * ADAPTIVE_SCALE / V_range
+		if (V_raw <= V_min) {
+			metrics->V_normalized = 0;
+		} else if (V_raw >= V_max) {
+			metrics->V_normalized = ADAPTIVE_SCALE;
+		} else {
+			V_norm_calc = ((s64)(V_raw - V_min) * ADAPTIVE_SCALE) /
+				      V_range;
+			metrics->V_normalized = (u32)V_norm_calc;
+		}
+
+		// Step 4: 输出调试信息（Phase 3.1验证用）
+		trace_printk(
+			"[Adaptive-Score] Event=%d Vibrate=%u Hotness=%u Overhead=%u V_raw=%d V_norm=%u\n",
+			type, vibrate, hotness, overhead, V_raw,
+			metrics->V_normalized);
+	}
+
+	trace_printk("[Adaptive-Final] ===== Calculation Complete =====\n");
+}
+
+/**
+ * adaptive_metrics_init - 初始化自适应指标系统
+ * 
+ * 在pebs_init时调用，初始化：
+ * 1. event_sample_counts数组（开销计数器）
+ * 2. global_adaptive_metrics数组（分数存储）
+ */
+static void adaptive_metrics_init(void)
+{
+	enum event_type type;
+
+	// 初始化开销计数器
+	for (type = 0; type < EVENT_TYPE_MAX; type++) {
+		atomic64_set(&event_sample_counts[type], 0);
+	}
+
+	// 初始化自适应指标
+	memset(global_adaptive_metrics, 0, sizeof(global_adaptive_metrics));
+
+	trace_printk("[Adaptive-Init] Adaptive metrics system initialized\n");
+}
+
+// ============================================================================
+// Phase 3.2: Period自适应更新函数实现
+// ============================================================================
+
+/**
+ * map_score_to_period - 将归一化分数映射到目标Period
+ * @v_normalized: 归一化分数 [0, 10000]
+ * 
+ * 返回：目标Period [MIN_PERIOD, MAX_PERIOD]
+ * 
+ * 算法：逆向线性映射
+ *   V_norm=0 (0%)     → Period=200,000 (最低频率)
+ *   V_norm=5000 (50%) → Period=101,000 (中等频率)
+ *   V_norm=10000(100%)→ Period=2,000   (最高频率)
+ * 
+ * 公式：Period = MAX_PERIOD - (V_norm × range / ADAPTIVE_SCALE)
+ */
+static u64 map_score_to_period(u32 v_normalized)
+{
+	u64 period;
+	u64 range = MAX_PERIOD - MIN_PERIOD;  // 198000
+	
+	if (v_normalized >= ADAPTIVE_SCALE) {
+		// 分数满分 → 最小Period（最高频率）
+		period = MIN_PERIOD;
+	} else if (v_normalized == 0) {
+		// 分数为0 → 最大Period（最低频率）
+		period = MAX_PERIOD;
+	} else {
+		// 线性映射：period = MAX - (v_norm × range / SCALE)
+		period = MAX_PERIOD - ((u64)v_normalized * range / ADAPTIVE_SCALE);
+	}
+	
+	return period;
 }
 
 int ksamplingd_init(pid_t pid, int node)
