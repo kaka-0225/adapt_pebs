@@ -97,11 +97,11 @@ struct adaptive_metrics {
 	u32 overhead_score; // 开销分数 [0, 10000]
 	s32 V_raw; // 原始综合分数（可能为负）
 	u32 V_normalized; // 归一化分数 [0, 10000]
-	
+
 	// Phase 3.2 新增字段：Period自适应更新
-	u64 target_period;  // 目标Period（从V_norm映射得到）
+	u64 target_period; // 目标Period（从V_norm映射得到）
 	u64 current_period; // 当前Period（从硬件读取）
-	u64 new_period;     // EMA平滑后的新Period
+	u64 new_period; // EMA平滑后的新Period
 };
 
 // 全局自适应指标数组（9个Event）
@@ -112,18 +112,19 @@ static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
 // ============================================================================
 
 // EMA平滑系数（α = 0.3）
-#define EMA_ALPHA_NUM   3      // 分子
-#define EMA_ALPHA_DEN   10     // 分母，α = 3/10 = 0.3
+#define EMA_ALPHA_NUM 3 // 分子
+#define EMA_ALPHA_DEN 10 // 分母，α = 3/10 = 0.3
 
 // Period范围
-#define MIN_PERIOD      2000ULL    // 最高采样频率（2000个事件采样1次）
-#define MAX_PERIOD      200000ULL  // 最低采样频率（200000个事件采样1次）
+#define MIN_PERIOD 2000ULL // 最高采样频率（2000个事件采样1次）
+#define MAX_PERIOD 200000ULL // 最低采样频率（200000个事件采样1次）
 
 // 全局开销预算
-#define GLOBAL_OVERHEAD_BUDGET 50000  // 每10秒最多采样50000次
+#define GLOBAL_OVERHEAD_BUDGET 50000 // 每10秒最多采样50000次
 
 // 更新周期
-#define ADAPTIVE_UPDATE_INTERVAL_SEC 10  // 10秒
+#define ADAPTIVE_UPDATE_INTERVAL_SEC 10 // 10秒
+#define ADAPTIVE_UPDATE_INTERVAL_MS (ADAPTIVE_UPDATE_INTERVAL_SEC * 1000) // 10000毫秒
 
 // 定时器
 static struct delayed_work adaptive_update_work;
@@ -151,8 +152,7 @@ static u64 map_score_to_period(u32 v_normalized);
 static u64 apply_ema_to_period(u64 current_period, u64 target_period);
 static u64 get_current_period(enum event_type type);
 static void update_pebs_event_period(enum event_type type, u64 new_period);
-static void apply_global_overhead_control(void);
-static void adaptive_update_work_handler(struct work_struct *work);
+void adaptive_update_work_handler(struct work_struct *work);
 static void adaptive_timer_init(void);
 static void adaptive_timer_stop(void);
 
@@ -331,6 +331,11 @@ static void pebs_disable(void)
 {
 	int cpu, event;
 	printk("pebs disable\n");
+
+	// ========================================================================
+	// Phase 3.2: 停止周期性Period自适应更新定时器
+	// ========================================================================
+	adaptive_timer_stop();
 
 	/* Check if mem_event was initialized */
 	if (!mem_event)
@@ -1286,7 +1291,12 @@ static void adaptive_metrics_init(void)
 	memset(global_adaptive_metrics, 0, sizeof(global_adaptive_metrics));
 
 	trace_printk("[Adaptive-Init] Adaptive metrics system initialized\n");
+	// ========================================================================
+	// Phase 3.2: 启动周期性Period自适应更新定时器
+	// ========================================================================
+	adaptive_timer_init();
 }
+
 
 // ============================================================================
 // Phase 3.2: Period自适应更新函数实现
@@ -1308,8 +1318,8 @@ static void adaptive_metrics_init(void)
 static u64 map_score_to_period(u32 v_normalized)
 {
 	u64 period;
-	u64 range = MAX_PERIOD - MIN_PERIOD;  // 198000
-	
+	u64 range = MAX_PERIOD - MIN_PERIOD; // 198000
+
 	if (v_normalized >= ADAPTIVE_SCALE) {
 		// 分数满分 → 最小Period（最高频率）
 		period = MIN_PERIOD;
@@ -1318,10 +1328,224 @@ static u64 map_score_to_period(u32 v_normalized)
 		period = MAX_PERIOD;
 	} else {
 		// 线性映射：period = MAX - (v_norm × range / SCALE)
-		period = MAX_PERIOD - ((u64)v_normalized * range / ADAPTIVE_SCALE);
+		period = MAX_PERIOD -
+			 ((u64)v_normalized * range / ADAPTIVE_SCALE);
 	}
-	
+
 	return period;
+}
+
+/**
+ * apply_ema_to_period - 使用EMA平滑Period调整
+ * @current_period: 当前Period（从硬件读取）
+ * @target_period: 目标Period（从分数映射得到）
+ * 
+ * 返回：EMA平滑后的新Period [MIN_PERIOD, MAX_PERIOD]
+ * 
+ * 算法：指数移动平均（EMA, α=0.3）
+ *   new_period = α × target_period + (1-α) × current_period
+ *   new_period = (3 × target + 7 × current) / 10
+ * 
+ * 效果：Period从current逐渐调整到target，避免突变
+ * 
+ * 示例：
+ *   current=100000, target=80000
+ *   → new = (3×80000 + 7×100000)/10 = 94000
+ *   → 下次: new = (3×80000 + 7×94000)/10 = 89800
+ *   → 逐渐收敛到80000
+ */
+static u64 apply_ema_to_period(u64 current_period, u64 target_period)
+{
+	u64 new_period;
+
+	// EMA公式：new = (α_num×target + (α_den - α_num)×current) / α_den
+	//         new = (3×target + 7×current) / 10
+	new_period = (EMA_ALPHA_NUM * target_period +
+		      (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * current_period) /
+		     EMA_ALPHA_DEN;
+
+	// 边界限制
+	if (new_period < MIN_PERIOD)
+		new_period = MIN_PERIOD;
+	else if (new_period > MAX_PERIOD)
+		new_period = MAX_PERIOD;
+
+	return new_period;
+}
+
+/**
+ * get_current_period - 从perf_event读取当前Period
+ * @type: Event类型
+ * 
+ * 返回：当前Period，失败返回0
+ * 
+ * 遍历所有CPU，找到第一个匹配的Event并读取其Period
+ */
+static u64 get_current_period(enum event_type type)
+{
+	int cpu;
+	int event_idx;
+	u64 period = 0;
+
+	// 遍历所有CPU，找到第一个匹配的Event
+	for_each_online_cpu (cpu) {
+		if (!mem_event || !mem_event[cpu])
+			continue;
+
+		for (event_idx = 0; event_idx < N_HTMMEVENTS; event_idx++) {
+			if (get_event_type_from_id(event_idx) == type) {
+				struct perf_event *event =
+					mem_event[cpu][event_idx];
+				if (event) {
+					period = event->attr.sample_period;
+					return period; // 返回第一个找到的
+				}
+			}
+		}
+	}
+
+	return period;
+}
+
+/**
+ * update_pebs_event_period - 更新所有CPU的Event Period
+ * @type: Event类型
+ * @new_period: 新的Period值
+ * 
+ * 遍历所有CPU，更新匹配的Event的Period
+ * 必须先disable，修改后再enable
+ */
+static void update_pebs_event_period(enum event_type type, u64 new_period)
+{
+	int cpu, event_idx;
+
+	// 遍历所有CPU
+	for_each_online_cpu (cpu) {
+		if (!mem_event || !mem_event[cpu])
+			continue;
+
+		for (event_idx = 0; event_idx < N_HTMMEVENTS; event_idx++) {
+			if (get_event_type_from_id(event_idx) == type) {
+				struct perf_event *event =
+					mem_event[cpu][event_idx];
+				if (event) {
+					// 禁用 → 修改 → 启用
+					perf_event_disable(event);
+
+					event->attr.sample_period = new_period;
+					event->hw.sample_period = new_period;
+					local64_set(&event->hw.period_left,
+						    new_period);
+
+					perf_event_enable(event);
+				}
+			}
+		}
+	}
+}
+
+
+/**
+ * adaptive_update_work_handler - 定时器回调，执行Period自适应更新
+ * @work: delayed_work结构体
+ * 
+ * 每10秒执行一次，遍历所有Event类型：
+ * 1. 读取当前分数
+ * 2. 计算目标Period
+ * 3. EMA平滑调整
+ * 4. 更新硬件Period
+ * 5. 重新调度定时器
+ */
+void adaptive_update_work_handler(struct work_struct *work)
+{
+	enum event_type type;
+
+	printk(KERN_INFO "[HTMM-Adaptive] Timer callback triggered\n");
+	trace_printk("[Adaptive-Update] ===== Periodic update triggered =====\n");
+
+
+	// 首先计算最新的自适应分数
+	trace_printk("[Adaptive-Update] Calculating current metrics...\n");
+	calculate_adaptive_metrics();
+	// 遍历所有Event类型
+	for (type = 0; type < EVENT_TYPE_MAX; type++) {
+		struct adaptive_metrics *metrics = &global_adaptive_metrics[type];
+		u64 current_score, target_period, current_period, new_period;
+
+		// 1. 读取当前分数
+		current_score = metrics->V_normalized;
+		if (current_score == 0) {
+			trace_printk(
+				"[Adaptive-Update] Event %d: score=0, skipping\n",
+				type);
+			continue;
+		}
+
+		// 2. 计算目标Period
+		target_period = map_score_to_period((u32)current_score);
+
+		// 3. 读取当前Period
+		current_period = get_current_period(type);
+		if (current_period == 0) {
+			trace_printk(
+				"[Adaptive-Update] Event %d: failed to get current period\n",
+				type);
+			continue;
+		}
+
+		// 4. EMA平滑调整
+		new_period = apply_ema_to_period(current_period, target_period);
+
+		// 5. 更新硬件Period
+		update_pebs_event_period(type, new_period);
+
+		trace_printk(
+			"[Adaptive-Period] Event %d: Period updated %llu → %llu (EMA smoothed)\n",
+			type, current_period, new_period);
+	}
+
+	trace_printk("[Adaptive-Update] ===== Update completed =====\n");
+
+	// 重新调度下一次定时器 (10秒后)
+	if (adaptive_timer_running) {
+		schedule_delayed_work(
+			&adaptive_update_work,
+			msecs_to_jiffies(ADAPTIVE_UPDATE_INTERVAL_MS));
+	}
+}
+EXPORT_SYMBOL(adaptive_update_work_handler);
+
+/**
+ * adaptive_timer_init - 启动周期性Period自适应更新定时器
+ * 
+ * 在pebs_init时调用，启动10秒周期的定时器
+ */
+static void adaptive_timer_init(void)
+{
+	trace_printk("[Adaptive-Timer] Initializing periodic update timer (interval=%d ms)\n",
+		     ADAPTIVE_UPDATE_INTERVAL_MS);
+
+	adaptive_timer_running = true;
+	INIT_DELAYED_WORK(&adaptive_update_work, adaptive_update_work_handler);
+	schedule_delayed_work(&adaptive_update_work,
+			      msecs_to_jiffies(ADAPTIVE_UPDATE_INTERVAL_MS));
+
+	trace_printk("[Adaptive-Timer] Timer started successfully\n");
+}
+
+/**
+ * adaptive_timer_stop - 停止周期性Period自适应更新定时器
+ * 
+ * 在pebs_disable时调用，停止定时器
+ */
+static void adaptive_timer_stop(void)
+{
+	trace_printk("[Adaptive-Timer] Stopping periodic update timer\n");
+
+	adaptive_timer_running = false;
+	cancel_delayed_work_sync(&adaptive_update_work);
+
+	trace_printk("[Adaptive-Timer] Timer stopped successfully\n");
 }
 
 int ksamplingd_init(pid_t pid, int node)
