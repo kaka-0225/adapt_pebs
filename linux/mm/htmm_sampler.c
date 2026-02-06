@@ -280,15 +280,15 @@ static int pebs_init(pid_t pid, int node)
 	// ============================================================================
 	// Phase 1: 初始化Event堆
 	// ============================================================================
-	trace_printk("[Heap-Init] Initializing %d event heaps, capacity=%u\n",
-		     EVENT_TYPE_MAX, heap_capacity);
+ // trace_printk("[Heap-Init] Initializing %d event heaps, capacity=%u\n",
+       // EVENT_TYPE_MAX, heap_capacity);
 
 	for (event = 0; event < EVENT_TYPE_MAX; event++) {
 		int ret = heap_init(&global_event_heaps[event], heap_capacity);
 		if (ret) {
-			trace_printk(
-				"[Heap-ERROR] Failed to init heap for event %d, ret=%d\n",
-				event, ret);
+   // trace_printk(
+    // "[Heap-ERROR] Failed to init heap for event %d, ret=%d\n",
+    // event, ret);
 
 			// 清理已创建的堆
 			while (--event >= 0)
@@ -298,26 +298,26 @@ static int pebs_init(pid_t pid, int node)
 			pebs_disable();
 			return ret;
 		}
-
-		trace_printk(
-			"[Heap-Init] Event %d (%s) heap created, capacity=%u\n",
-			event,
-			event == EVENT_L1_HIT	 ? "L1_HIT" :
-			event == EVENT_L1_MISS	 ? "L1_MISS" :
-			event == EVENT_L2_HIT	 ? "L2_HIT" :
-			event == EVENT_L2_MISS	 ? "L2_MISS" :
-			event == EVENT_L3_HIT	 ? "L3_HIT" :
-			event == EVENT_L3_MISS	 ? "L3_MISS" :
-			event == EVENT_DRAM_READ ? "DRAM_READ" :
-			event == EVENT_NVM_READ	 ? "NVM_READ" :
-			event == EVENT_MEM_WRITE ? "MEM_WRITE" :
-						   "UNKNOWN",
-			heap_capacity);
+// 
+  // trace_printk(
+   // "[Heap-Init] Event %d (%s) heap created, capacity=%u\n",
+   // event,
+   // event == EVENT_L1_HIT	 ? "L1_HIT" :
+   // event == EVENT_L1_MISS	 ? "L1_MISS" :
+   // event == EVENT_L2_HIT	 ? "L2_HIT" :
+   // event == EVENT_L2_MISS	 ? "L2_MISS" :
+   // event == EVENT_L3_HIT	 ? "L3_HIT" :
+   // event == EVENT_L3_MISS	 ? "L3_MISS" :
+   // event == EVENT_DRAM_READ ? "DRAM_READ" :
+   // event == EVENT_NVM_READ	 ? "NVM_READ" :
+   // event == EVENT_MEM_WRITE ? "MEM_WRITE" :
+         // "UNKNOWN",
+   // heap_capacity);
 	}
-
-	trace_printk(
-		"[Heap-Init] All %d event heaps initialized successfully\n",
-		EVENT_TYPE_MAX);
+// 
+ // trace_printk(
+  // "[Heap-Init] All %d event heaps initialized successfully\n",
+  // EVENT_TYPE_MAX);
 
 	// ============================================================================
 	// Phase 3.1: 初始化自适应指标系统
@@ -355,38 +355,38 @@ static void pebs_disable(void)
 	// ============================================================================
 	// Phase 3.1: 验证自适应指标计算（销毁堆前）
 	// ============================================================================
-	trace_printk(
-		"[Adaptive-Trigger] Calculating metrics before heap destruction\n");
+ // trace_printk(
+  // "[Adaptive-Trigger] Calculating metrics before heap destruction\n");
 	calculate_adaptive_metrics();
 
 	// ============================================================================
 	// Phase 1: 清理Event堆
 	// ============================================================================
-	trace_printk("[Heap-Destroy] Destroying %d event heaps\n",
-		     EVENT_TYPE_MAX);
+ // trace_printk("[Heap-Destroy] Destroying %d event heaps\n",
+       // EVENT_TYPE_MAX);
 
 	for (event = 0; event < EVENT_TYPE_MAX; event++) {
 		struct event_heap *heap = &global_event_heaps[event];
-
-		trace_printk(
-			"[Heap-Destroy] Event %d (%s) heap destroyed, final_size=%u\n",
-			event,
-			event == EVENT_L1_HIT	 ? "L1_HIT" :
-			event == EVENT_L1_MISS	 ? "L1_MISS" :
-			event == EVENT_L2_HIT	 ? "L2_HIT" :
-			event == EVENT_L2_MISS	 ? "L2_MISS" :
-			event == EVENT_L3_HIT	 ? "L3_HIT" :
-			event == EVENT_L3_MISS	 ? "L3_MISS" :
-			event == EVENT_DRAM_READ ? "DRAM_READ" :
-			event == EVENT_NVM_READ	 ? "NVM_READ" :
-			event == EVENT_MEM_WRITE ? "MEM_WRITE" :
-						   "UNKNOWN",
-			heap->size);
+// 
+  // trace_printk(
+   // "[Heap-Destroy] Event %d (%s) heap destroyed, final_size=%u\n",
+   // event,
+   // event == EVENT_L1_HIT	 ? "L1_HIT" :
+   // event == EVENT_L1_MISS	 ? "L1_MISS" :
+   // event == EVENT_L2_HIT	 ? "L2_HIT" :
+   // event == EVENT_L2_MISS	 ? "L2_MISS" :
+   // event == EVENT_L3_HIT	 ? "L3_HIT" :
+   // event == EVENT_L3_MISS	 ? "L3_MISS" :
+   // event == EVENT_DRAM_READ ? "DRAM_READ" :
+   // event == EVENT_NVM_READ	 ? "NVM_READ" :
+   // event == EVENT_MEM_WRITE ? "MEM_WRITE" :
+         // "UNKNOWN",
+   // heap->size);
 
 		heap_destroy(heap);
 	}
-
-	trace_printk("[Heap-Destroy] All event heaps destroyed\n");
+// 
+ // trace_printk("[Heap-Destroy] All event heaps destroyed\n");
 }
 
 static void pebs_enable(void)
@@ -474,8 +474,8 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 		pinfo->fluctuation = 0;
 
 		// 【trace_printk】：记录首次采样
-		trace_printk("[Welford-Init] pg=%px, init_time=%llu\n", pinfo,
-			     now);
+  // trace_printk("[Welford-Init] pg=%px, init_time=%llu\n", pinfo,
+        // now);
 		return;
 	}
 
@@ -483,10 +483,10 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	// ⚠️ FIX: PEBS 时间戳可能乱序！忽略时间倒退的样本
 	if (unlikely(now <= pinfo->last_hit_time)) {
 		// 时间戳倒退或相等，完全跳过本次样本
-		trace_printk(
-			"[Welford-SKIP-TIME-REWIND] pg=%px, now=%llu <= last=%llu (delta=%lld)\n",
-			pinfo, now, pinfo->last_hit_time,
-			(s64)(now - pinfo->last_hit_time));
+  // trace_printk(
+   // "[Welford-SKIP-TIME-REWIND] pg=%px, now=%llu <= last=%llu (delta=%lld)\n",
+   // pinfo, now, pinfo->last_hit_time,
+   // (s64)(now - pinfo->last_hit_time));
 		// 不更新 last_hit_time，不增加 adaptive_hit，完全忽略这个乱序样本
 		return;
 	}
@@ -496,9 +496,9 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 
 	// 【trace_printk】：监控原始间隔值
 	// 用途：判断 u64 是否会溢出，观察间隔分布
-	trace_printk(
-		"[Welford-Interval] pg=%px, raw_interval=%llu, scaled=%llu\n",
-		pinfo, interval, x_scaled);
+ // trace_printk(
+  // "[Welford-Interval] pg=%px, raw_interval=%llu, scaled=%llu\n",
+  // pinfo, interval, x_scaled);
 
 	// ========== 第 3 步：更新时间戳 ==========
 	pinfo->last_hit_time = now;
@@ -509,9 +509,9 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	// 【trace_printk】：监控样本数，判断 u32 (42亿) 是否足够
 	// 每达到 2^20 (约 100 万) 的倍数时打印一次里程碑
 	if (unlikely((n & 0xFFFFF) == 0)) {
-		trace_printk(
-			"[Welford-Milestone] pg=%px, n=%u (every 1M samples)\n",
-			pinfo, n);
+  // trace_printk(
+   // "[Welford-Milestone] pg=%px, n=%u (every 1M samples)\n",
+   // pinfo, n);
 	}
 
 	// ========== 第 5 步：Welford 方差计算 ==========
@@ -521,9 +521,9 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 
 	// 【trace_printk】：监控 delta1 范围
 	// 用途：判断 s64 是否足够，观察是否有异常大的波动
-	trace_printk(
-		"[Welford-Delta1] pg=%px, delta=%lld, x_scaled=%llu, old_mean=%llu\n",
-		pinfo, delta, x_scaled, pinfo->mean_interval);
+ // trace_printk(
+  // "[Welford-Delta1] pg=%px, delta=%lld, x_scaled=%llu, old_mean=%llu\n",
+  // pinfo, delta, x_scaled, pinfo->mean_interval);
 
 	// 步骤 5.2：mean_n = mean_{n-1} + delta / n
 	// 注意：必须使用 div_s64 进行 64 位有符号除法
@@ -533,8 +533,8 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	delta2 = (s64)x_scaled - (s64)pinfo->mean_interval;
 
 	// 【trace_printk】：监控 delta2 范围
-	trace_printk("[Welford-Delta2] pg=%px, delta2=%lld, new_mean=%llu\n",
-		     pinfo, delta2, pinfo->mean_interval);
+ // trace_printk("[Welford-Delta2] pg=%px, delta2=%lld, new_mean=%llu\n",
+       // pinfo, delta2, pinfo->mean_interval);
 
 	// 步骤 5.4：M2_n = M2_{n-1} + delta * delta2
 	// 注意：delta * delta2 会放大到 1024*1024 = 2^20 倍
@@ -543,16 +543,16 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 
 	// ========== 【核心 trace_printk】：汇总所有字段数值 ==========
 	// 这是最重要的日志，用于离线分析各字段的位数是否合适
-	trace_printk(
-		"[Welford-Summary] pg=%px | n=%u | mean=%llu | M2=%llu | var_approx=%llu | interval=%llu\n",
-		pinfo,
-		pinfo->adaptive_hit, // 样本数（u32，最大 ~42 亿）
-		pinfo->mean_interval, // 均值（u64，1024 倍缩放）
-		pinfo->fluctuation, // M2（u64，1024 倍缩放）
-		(pinfo->adaptive_hit > 1) ?
-			(pinfo->fluctuation / (pinfo->adaptive_hit - 1)) :
-			0, // 近似标准差²
-		interval); // 原始间隔（未缩放）
+ // trace_printk(
+  // "[Welford-Summary] pg=%px | n=%u | mean=%llu | M2=%llu | var_approx=%llu | interval=%llu\n",
+  // pinfo,
+  // pinfo->adaptive_hit, // 样本数（u32，最大 ~42 亿）
+  // pinfo->mean_interval, // 均值（u64，1024 倍缩放）
+  // pinfo->fluctuation, // M2（u64，1024 倍缩放）
+  // (pinfo->adaptive_hit > 1) ?
+   // (pinfo->fluctuation / (pinfo->adaptive_hit - 1)) :
+   // 0, // 近似标准差²
+  // interval); // 原始间隔（未缩放）
 }
 
 static int ksamplingd(void *data)
@@ -673,11 +673,11 @@ static int ksamplingd(void *data)
 						if (!valid_va(he->addr)) {
 							break;
 						}
-						trace_printk(
-							"[PEBS] CPU=%d Event=%d PID=%u TID=%u Addr=0x%llx IP=0x%llx Time=%llu\n",
-							cpu, event, he->pid,
-							he->tid, he->addr,
-							he->ip, he->time);
+      // trace_printk(
+       // "[PEBS] CPU=%d Event=%d PID=%u TID=%u Addr=0x%llx IP=0x%llx Time=%llu\n",
+       // cpu, event, he->pid,
+       // he->tid, he->addr,
+       // he->ip, he->time);
 						update_pginfo(he->pid, he->addr,
 							      event, he->time);
 						//count_vm_event(HTMM_NR_SAMPLED);
@@ -707,11 +707,11 @@ static int ksamplingd(void *data)
 						break;
 					}
 					if (nr_sampled % 500000 == 0) {
-						trace_printk(
-							"nr_sampled: %llu, nr_dram: %llu, nr_nvm: %llu, nr_write: %llu, nr_throttled: %llu \n",
-							nr_sampled, nr_dram,
-							nr_nvm, nr_write,
-							nr_throttled);
+      // trace_printk(
+       // "nr_sampled: %llu, nr_dram: %llu, nr_nvm: %llu, nr_write: %llu, nr_throttled: %llu \n",
+       // nr_sampled, nr_dram,
+       // nr_nvm, nr_write,
+       // nr_throttled);
 						nr_dram = 0;
 						nr_nvm = 0;
 						nr_write = 0;
@@ -796,10 +796,10 @@ static int ksamplingd(void *data)
 				hr = 0;
 			else
 				hr = hr_dram * 10000 / (hr_dram + hr_nvm);
-			trace_printk(
-				"sample_period: %lu || cputime: %lu  || hit ratio: %lu\n",
-				get_sample_period(sample_period), trace_cputime,
-				hr);
+   // trace_printk(
+    // "sample_period: %lu || cputime: %lu  || hit ratio: %lu\n",
+    // get_sample_period(sample_period), trace_cputime,
+    // hr);
 
 			hr_dram = hr_nvm = 0;
 			trace_cputime = cur;
@@ -848,8 +848,8 @@ static int heap_init(struct event_heap *heap, u32 capacity)
 	heap->entries =
 		kmalloc_array(capacity, sizeof(struct heap_entry), GFP_KERNEL);
 	if (!heap->entries) {
-		trace_printk("[Heap-ERROR] Failed to allocate %u entries\n",
-			     capacity);
+  // trace_printk("[Heap-ERROR] Failed to allocate %u entries\n",
+        // capacity);
 		return -ENOMEM;
 	}
 
@@ -996,8 +996,8 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
 	if (idx >= 0) {
 		heap->entries[idx].event_hit_count++;
 		heap_sift_up(heap, idx); // 重新排序
-		trace_printk("[Heap-Update] pinfo=%p new_hit=%u\n", pinfo,
-			     heap->entries[idx].event_hit_count);
+  // trace_printk("[Heap-Update] pinfo=%p new_hit=%u\n", pinfo,
+        // heap->entries[idx].event_hit_count);
 		spin_unlock_irqrestore(&heap->lock, flags);
 		return;
 	}
@@ -1008,8 +1008,8 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
 		heap->entries[heap->size].event_hit_count = 1;
 		heap_sift_up(heap, heap->size);
 		heap->size++;
-		trace_printk("[Heap-Insert] pinfo=%p heap_size=%d\n", pinfo,
-			     heap->size);
+  // trace_printk("[Heap-Insert] pinfo=%p heap_size=%d\n", pinfo,
+        // heap->size);
 		spin_unlock_irqrestore(&heap->lock, flags);
 		return;
 	}
@@ -1020,13 +1020,13 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
 		heap->entries[0].pinfo = pinfo;
 		heap->entries[0].event_hit_count = 1;
 		heap_sift_down(heap, 0);
-		trace_printk("[Heap-Replace] pinfo=%p (evict cold top)\n",
-			     pinfo);
+  // trace_printk("[Heap-Replace] pinfo=%p (evict cold top)\n",
+        // pinfo);
 	} else {
 		// 堆顶已是热页，新Page优先级不够，丢弃
-		trace_printk(
-			"[Heap-Discard] pinfo=%p (heap full, top_hit=%u)\n",
-			pinfo, heap->entries[0].event_hit_count);
+  // trace_printk(
+   // "[Heap-Discard] pinfo=%p (heap full, top_hit=%u)\n",
+   // pinfo, heap->entries[0].event_hit_count);
 	}
 
 	spin_unlock_irqrestore(&heap->lock, flags);
@@ -1036,7 +1036,7 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
 void update_event_heap_from_sample(int event_id, pginfo_t *pinfo)
 {
 	if (event_id < 0 || event_id >= EVENT_TYPE_MAX) {
-		trace_printk("[Heap-Error] Invalid event_id=%d\n", event_id);
+  // trace_printk("[Heap-Error] Invalid event_id=%d\n", event_id);
 		return;
 	}
 
@@ -1217,9 +1217,9 @@ static void calculate_adaptive_metrics(void)
 	s32 V_max =
 		9000; // 最大可能分数 = 10000*4000 + 10000*5000 + 0*(-1000) = 90000000 / 10000 = 9000
 	s32 V_range = V_max - V_min; // 10000
-
-	trace_printk(
-		"[Adaptive-Start] ===== Calculate Adaptive Metrics =====\n");
+// 
+ // trace_printk(
+  // "[Adaptive-Start] ===== Calculate Adaptive Metrics =====\n");
 
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
 		struct adaptive_metrics *metrics =
@@ -1262,13 +1262,13 @@ static void calculate_adaptive_metrics(void)
 		}
 
 		// Step 4: 输出调试信息（Phase 3.1验证用）
-		trace_printk(
-			"[Adaptive-Score] Event=%d Vibrate=%u Hotness=%u Overhead=%u V_raw=%d V_norm=%u\n",
-			type, vibrate, hotness, overhead, V_raw,
-			metrics->V_normalized);
+  // trace_printk(
+   // "[Adaptive-Score] Event=%d Vibrate=%u Hotness=%u Overhead=%u V_raw=%d V_norm=%u\n",
+   // type, vibrate, hotness, overhead, V_raw,
+   // metrics->V_normalized);
 	}
-
-	trace_printk("[Adaptive-Final] ===== Calculation Complete =====\n");
+// 
+ // trace_printk("[Adaptive-Final] ===== Calculation Complete =====\n");
 }
 
 /**
@@ -1289,8 +1289,8 @@ static void adaptive_metrics_init(void)
 
 	// 初始化自适应指标
 	memset(global_adaptive_metrics, 0, sizeof(global_adaptive_metrics));
-
-	trace_printk("[Adaptive-Init] Adaptive metrics system initialized\n");
+// 
+ // trace_printk("[Adaptive-Init] Adaptive metrics system initialized\n");
 	// ========================================================================
 	// Phase 3.2: 启动周期性Period自适应更新定时器
 	// ========================================================================
@@ -1461,11 +1461,11 @@ void adaptive_update_work_handler(struct work_struct *work)
 	enum event_type type;
 
 	printk(KERN_INFO "[HTMM-Adaptive] Timer callback triggered\n");
-	trace_printk("[Adaptive-Update] ===== Periodic update triggered =====\n");
+ // trace_printk("[Adaptive-Update] ===== Periodic update triggered =====\n");
 
 
 	// 首先计算最新的自适应分数
-	trace_printk("[Adaptive-Update] Calculating current metrics...\n");
+ // trace_printk("[Adaptive-Update] Calculating current metrics...\n");
 	calculate_adaptive_metrics();
 	// 遍历所有Event类型
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
@@ -1475,9 +1475,9 @@ void adaptive_update_work_handler(struct work_struct *work)
 		// 1. 读取当前分数
 		current_score = metrics->V_normalized;
 		if (current_score == 0) {
-			trace_printk(
-				"[Adaptive-Update] Event %d: score=0, skipping\n",
-				type);
+   // trace_printk(
+    // "[Adaptive-Update] Event %d: score=0, skipping\n",
+    // type);
 			continue;
 		}
 
@@ -1487,9 +1487,9 @@ void adaptive_update_work_handler(struct work_struct *work)
 		// 3. 读取当前Period
 		current_period = get_current_period(type);
 		if (current_period == 0) {
-			trace_printk(
-				"[Adaptive-Update] Event %d: failed to get current period\n",
-				type);
+   // trace_printk(
+    // "[Adaptive-Update] Event %d: failed to get current period\n",
+    // type);
 			continue;
 		}
 
@@ -1498,13 +1498,13 @@ void adaptive_update_work_handler(struct work_struct *work)
 
 		// 5. 更新硬件Period
 		update_pebs_event_period(type, new_period);
-
-		trace_printk(
-			"[Adaptive-Period] Event %d: Period updated %llu → %llu (EMA smoothed)\n",
-			type, current_period, new_period);
+// 
+  // trace_printk(
+   // "[Adaptive-Period] Event %d: Period updated %llu → %llu (EMA smoothed)\n",
+   // type, current_period, new_period);
 	}
-
-	trace_printk("[Adaptive-Update] ===== Update completed =====\n");
+// 
+ // trace_printk("[Adaptive-Update] ===== Update completed =====\n");
 
 	// 重新调度下一次定时器 (10秒后)
 	if (adaptive_timer_running) {
@@ -1522,15 +1522,15 @@ EXPORT_SYMBOL(adaptive_update_work_handler);
  */
 static void adaptive_timer_init(void)
 {
-	trace_printk("[Adaptive-Timer] Initializing periodic update timer (interval=%d ms)\n",
-		     ADAPTIVE_UPDATE_INTERVAL_MS);
+ // trace_printk("[Adaptive-Timer] Initializing periodic update timer (interval=%d ms)\n",
+       // ADAPTIVE_UPDATE_INTERVAL_MS);
 
 	adaptive_timer_running = true;
 	INIT_DELAYED_WORK(&adaptive_update_work, adaptive_update_work_handler);
 	schedule_delayed_work(&adaptive_update_work,
 			      msecs_to_jiffies(ADAPTIVE_UPDATE_INTERVAL_MS));
-
-	trace_printk("[Adaptive-Timer] Timer started successfully\n");
+// 
+ // trace_printk("[Adaptive-Timer] Timer started successfully\n");
 }
 
 /**
@@ -1540,12 +1540,12 @@ static void adaptive_timer_init(void)
  */
 static void adaptive_timer_stop(void)
 {
-	trace_printk("[Adaptive-Timer] Stopping periodic update timer\n");
+ // trace_printk("[Adaptive-Timer] Stopping periodic update timer\n");
 
 	adaptive_timer_running = false;
 	cancel_delayed_work_sync(&adaptive_update_work);
-
-	trace_printk("[Adaptive-Timer] Timer stopped successfully\n");
+// 
+ // trace_printk("[Adaptive-Timer] Timer stopped successfully\n");
 }
 
 int ksamplingd_init(pid_t pid, int node)
