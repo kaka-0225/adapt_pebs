@@ -178,17 +178,13 @@ static __u64 get_pebs_event(enum events e)
 {
 	switch (e) {
 	case L1_HIT:
-		return ICL_L1_HIT;
 	case L1_MISS:
-		return ICL_L1_MISS;
 	case L2_HIT:
-		return ICL_L2_HIT;
 	case L2_MISS:
-		return ICL_L2_MISS;
 	case L3_HIT:
-		return ICL_L3_HIT;
 	case L3_MISS:
-		return ICL_L3_MISS;
+		/* GUPS_Test/test1: disable L1-L3 events, align with Baseline */
+		return N_HTMMEVENTS;
 	case DRAMREAD:
 		return ICL_LOCAL_DRAM;
 	case NVMREAD:
@@ -213,20 +209,24 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 	attr.size = sizeof(struct perf_event_attr);
 	attr.config = config;
 	attr.config1 = config1;
-	// 五级采样周期：对齐 Baseline 最优值
-	if (type == L1_HIT || type == L1_MISS || type == MEMWRITE) {
-		attr.sample_period = get_sample_inst_period(0); // 100,003
-	} else if (type == L2_HIT || type == L2_MISS) {
-		attr.sample_period = L2_SAMPLE_PERIOD; // 50,000
-	} else if (type == L3_HIT || type == L3_MISS) {
-		attr.sample_period = 5000;
-	} else if (type == DRAMREAD) {
-		attr.sample_period = 3007;
-	} else if (type == NVMREAD) {
-		attr.sample_period = 1007;
+	/* GUPS_Test/test1: align with Baseline periods
+	 * DRAMREAD=199, NVMREAD=199, MEMWRITE=100003
+	//  * L1-L3 disabled in get_pebs_event(), won't reach here */
+	// if (type == MEMWRITE) {
+	// 	attr.sample_period = get_sample_inst_period(0); // 100,003
+	// } else if (type == DRAMREAD || type == NVMREAD) {
+	// 	attr.sample_period = get_sample_period(0); // 199
+	// } else {
+	// 	attr.sample_period = get_sample_period(0); // 199 fallback
+	// }
+	if (type == MEMWRITE) {
+		attr.sample_period = htmm_inst_sample_period;
+	} else if (type == DRAMREAD || type == NVMREAD) {
+		attr.sample_period = htmm_sample_period;
 	} else {
-		attr.sample_period = get_sample_period(0); // 199 fallback
+		attr.sample_period = htmm_sample_period; // fallback
 	}
+
 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR |
 			   PERF_SAMPLE_TIME;
 	attr.disabled = 0;
@@ -235,6 +235,7 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 	attr.exclude_callchain_kernel = 1;
 	attr.exclude_callchain_user = 1;
 	attr.precise_ip = 1;
+	attr.inherit = 1;
 	attr.enable_on_exec = 1;
 
 	if (pid == 0)
@@ -691,7 +692,7 @@ static int ksamplingd(void *data)
 						// he->ip, he->time);
 						update_pginfo(he->pid, he->addr,
 							      event, he->time);
-						//count_vm_event(HTMM_NR_SAMPLED);
+						count_vm_event(HTMM_NR_SAMPLED);
 						nr_sampled++;
 
 						// 暂时保持 DRAM/NVM 统计，L1/L2/L3 只计入 nr_sampled
