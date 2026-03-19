@@ -465,7 +465,8 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 }
 
 static unsigned long promote_page_list(struct list_head *page_list,
-				       pg_data_t *pgdat)
+				       pg_data_t *pgdat,
+				       struct mem_cgroup *memcg)
 {
 	LIST_HEAD(promote_pages);
 	LIST_HEAD(ret_pages);
@@ -489,6 +490,21 @@ static unsigned long promote_page_list(struct list_head *page_list,
 			goto __keep_locked;
 		if (PageTransHuge(page) && !thp_migration_supported())
 			goto __keep_locked;
+
+		/* Problem D fix: only promote pages that are truly hot */
+		if (PageAnon(page)) {
+			if (PageTransHuge(page)) {
+				struct page *meta = get_meta_page(page);
+
+				if (meta->idx < memcg->active_threshold)
+					goto __keep_locked;
+			} else {
+				int idx = get_pginfo_idx(page);
+
+				if (idx < (int)memcg->active_threshold)
+					goto __keep_locked;
+			}
+		}
 
 		list_add(&page->lru, &promote_pages);
 		unlock_page(page);
@@ -560,7 +576,8 @@ static unsigned long promote_active_list(unsigned long nr_to_scan,
 	if (nr_taken == 0)
 		return 0;
 
-	nr_promoted = promote_page_list(&page_list, pgdat);
+	nr_promoted =
+		promote_page_list(&page_list, pgdat, lruvec_memcg(lruvec));
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_pages_to_lru(lruvec, &page_list);
@@ -667,21 +684,8 @@ static unsigned long demote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
 		priority--;
 	} while (priority);
 
-	if (htmm_nowarm == 0) {
-		int target_nid =
-			htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
-		unsigned long nr_lowertier_active =
-			target_nid == NUMA_NO_NODE ?
-				0 :
-				need_lowertier_promotion(NODE_DATA(target_nid),
-							 memcg);
-
-		nr_lowertier_active = nr_lowertier_active < nr_to_reclaim ?
-					      nr_lowertier_active :
-					      nr_to_reclaim;
-		if (nr_lowertier_active && nr_reclaimed < nr_lowertier_active)
-			memcg->warm_threshold = memcg->active_threshold;
-	}
+	/* E-fix: removed warm_threshold override that was here.
+	 * warm_threshold is now managed solely by __adjust_active_threshold(). */
 
 	/* check the condition */
 	do {
@@ -785,10 +789,24 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 				check_transhuge_cooling((void *)memcg, page,
 							false);
 
-				if (meta->idx >= memcg->active_threshold)
-					still_hot = 2;
-				else
-					still_hot = 1;
+				/* B2-fix v2: On DRAM node, use warm_threshold
+				 * to protect recently-hot pages from being
+				 * demoted right after cooling halves their idx.
+				 * On PM node, use strict active_threshold to
+				 * prevent cold pages from staying on Active LRU
+				 * and being incorrectly promoted. */
+				if (node_is_toptier(pgdat->node_id)) {
+					if (meta->idx >= memcg->warm_threshold)
+						still_hot = 2;
+					else
+						still_hot = 1;
+				} else {
+					if (meta->idx >=
+					    memcg->active_threshold)
+						still_hot = 2;
+					else
+						still_hot = 1;
+				}
 			} else {
 				still_hot = cooling_page(page,
 							 lruvec_memcg(lruvec));

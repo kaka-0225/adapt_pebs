@@ -1233,7 +1233,9 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 	reset_memcg_stat(memcg);
 	memcg->cooling_clock++;
 	memcg->bp_active_threshold--;
-	memcg->cooled = true;
+	/* B-fix: extend post-cooling gradual threshold for entire cooling cycle
+	 * to prevent threshold jump that abandons unsampled hot pages */
+	memcg->cooled = htmm_cooling_period / htmm_adaptation_period;
 	smp_mb();
 	spin_unlock(&memcg->access_lock);
 	set_lru_cooling(mm);
@@ -1286,42 +1288,36 @@ static void __adjust_active_threshold(struct mm_struct *mm,
 	if (idx_bp < htmm_thres_hot)
 		idx_bp = htmm_thres_hot;
 
-	/* some pages may not be reflected in the histogram when cooling happens */
-	if (memcg->cooled) {
-		/* when cooling happens, thres will be current - 1 */
-		if (idx_hot < memcg->active_threshold)
-			if (memcg->active_threshold > 1)
+	/* B-fix: post-cooling stabilization — gradual ±1 threshold adjustment
+	 * for the entire cooling cycle to prevent threshold jumps that
+	 * abandon the majority of hot pages still recovering from halving */
+	if (memcg->cooled > 0) {
+		if (idx_hot < memcg->active_threshold) {
+			if (memcg->active_threshold > htmm_thres_hot)
 				memcg->active_threshold--;
-		if (idx_bp < memcg->bp_active_threshold)
-			memcg->bp_active_threshold = idx_bp;
+		} else if (idx_hot > memcg->active_threshold) {
+			memcg->active_threshold++;
+		}
+		memcg->bp_active_threshold = idx_bp;
 
-		memcg->cooled = false;
+		memcg->cooled--;
 		set_lru_adjusting(memcg, true);
 
 		if (memcg->need_split) {
-			/* set the target number of pages to be split */
 			set_memcg_nr_split(memcg);
-			/* set the split factor thres */
 			set_memcg_split_thres(memcg);
-			/* reset stat for split */
 			memcg->nr_sampled_for_split = 0;
 			memcg->need_split = false;
-			//trace_printk("memcg->nr_split: %lu, memcg->split_thres: %lu\n", memcg->nr_split, memcg->split_threshold);
 		}
-	} else { /* normal case */
+	} else { /* normal case — far from cooling, allow jumps */
 		if (idx_hot > memcg->active_threshold) {
-			//printk("thres: %d -> %d\n", memcg->active_threshold, idx_hot);
 			memcg->active_threshold = idx_hot;
 			set_lru_adjusting(memcg, true);
 		} else if (memcg->split_happen && htmm_thres_split &&
 			   idx_hot < memcg->active_threshold) {
-			/* if split happens, histogram may be changed.
-	     * Thus, hot-thres could be decreased */
 			memcg->active_threshold = idx_hot;
 			set_lru_adjusting(memcg, true);
-			//memcg->split_happen = false;
 		}
-		/* estimated base page histogram */
 		memcg->bp_active_threshold = idx_bp;
 	}
 
