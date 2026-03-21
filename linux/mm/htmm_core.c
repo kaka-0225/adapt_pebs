@@ -283,7 +283,6 @@ int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm)
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
 	struct page *pte_page;
 	pginfo_t *pginfo;
-	int hotness_factor;
 
 	if (!memcg || !memcg->htmm_enabled)
 		return 0;
@@ -296,10 +295,21 @@ int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm)
 	if (!pginfo)
 		return 0;
 
-	hotness_factor = get_accesses_from_idx(memcg->active_threshold + 1);
-
-	pginfo->total_accesses = hotness_factor;
-	pginfo->nr_accesses = hotness_factor;
+	/* F1-fix reverted: all pages init to active_threshold+1 (original Memtis).
+	 *
+	 * F1-fix (PM=cold, DRAM=hot init) was reverted because PEBS sampling
+	 * is too sparse (~0.035 hits/hot-page/adaptation) to discover all hot
+	 * pages.  With F1-fix, only ~7% of hot pages got PEBS-proven → DRAM
+	 * stalled at 10.4%.  The original "promote first, select later" approach
+	 * fills DRAM quickly (2.3M promotes vs 97K) and relies on cooling +
+	 * demotion to correct mistakes.  34.5% promote accuracy is acceptable
+	 * since cold promotes get corrected within 2 cooling cycles. */
+	{
+		int hotness_factor =
+			get_accesses_from_idx(memcg->active_threshold + 1);
+		pginfo->total_accesses = hotness_factor;
+		pginfo->nr_accesses = hotness_factor;
+	}
 	if (htmm_skip_cooling)
 		pginfo->cooling_clock = READ_ONCE(memcg->cooling_clock) + 1;
 	else
@@ -1233,6 +1243,16 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 	reset_memcg_stat(memcg);
 	memcg->cooling_clock++;
 	memcg->bp_active_threshold--;
+	/* H2-fix: proactively lower active_threshold during cooling.
+	 * Cooling halves all total_accesses (idx drops ~1), but post-cooling
+	 * histogram has all cooled pages concentrated in bucket (old_threshold-1).
+	 * With 2.6M pages in that bucket vs 2.3M DRAM capacity, idx_hot computes
+	 * as old_threshold (not old_threshold-1), so __adjust_active_threshold
+	 * never lowers the threshold → hot pages incorrectly become "warm" and
+	 * get demoted when DRAM pressure triggers.  Pre-decrementing here
+	 * ensures threshold tracks the halving. */
+	if (memcg->active_threshold > htmm_thres_hot)
+		memcg->active_threshold--;
 	/* B-fix: extend post-cooling gradual threshold for entire cooling cycle
 	 * to prevent threshold jump that abandons unsampled hot pages */
 	memcg->cooled = htmm_cooling_period / htmm_adaptation_period;
@@ -1288,37 +1308,38 @@ static void __adjust_active_threshold(struct mm_struct *mm,
 	if (idx_bp < htmm_thres_hot)
 		idx_bp = htmm_thres_hot;
 
-	/* B-fix: post-cooling stabilization — gradual ±1 threshold adjustment
-	 * for the entire cooling cycle to prevent threshold jumps that
-	 * abandon the majority of hot pages still recovering from halving */
-	if (memcg->cooled > 0) {
-		if (idx_hot < memcg->active_threshold) {
-			if (memcg->active_threshold > htmm_thres_hot)
-				memcg->active_threshold--;
-		} else if (idx_hot > memcg->active_threshold) {
-			memcg->active_threshold++;
-		}
-		memcg->bp_active_threshold = idx_bp;
-
+	/* H-fix: Asymmetric threshold adjustment.
+	 *
+	 * G-fix (symmetric ±1) prevented upward threshold jumps that caused
+	 * run13's collapse, but it also prevented fast downward adjustment
+	 * after cooling.  Cooling halves all page indices (idx → idx-1), so
+	 * the threshold must track downward quickly or hot pages appear cold
+	 * and get massively demoted (run15: 597K hot pages wrongly demoted,
+	 * DRAM dropped from 54% → 28%).
+	 *
+	 * Fix: allow threshold to JUMP DOWNWARD (track cooling's halving)
+	 * but only INCREMENT upward by +1 per adaptation period.
+	 * Upward jumps were the original catastrophic failure mode; downward
+	 * jumps are safe because they only make more pages "hot" (= more
+	 * promotions, never mass demotion). */
+	if (memcg->cooled > 0)
 		memcg->cooled--;
-		set_lru_adjusting(memcg, true);
 
-		if (memcg->need_split) {
-			set_memcg_nr_split(memcg);
-			set_memcg_split_thres(memcg);
-			memcg->nr_sampled_for_split = 0;
-			memcg->need_split = false;
-		}
-	} else { /* normal case — far from cooling, allow jumps */
-		if (idx_hot > memcg->active_threshold) {
-			memcg->active_threshold = idx_hot;
-			set_lru_adjusting(memcg, true);
-		} else if (memcg->split_happen && htmm_thres_split &&
-			   idx_hot < memcg->active_threshold) {
-			memcg->active_threshold = idx_hot;
-			set_lru_adjusting(memcg, true);
-		}
-		memcg->bp_active_threshold = idx_bp;
+	if (idx_hot < memcg->active_threshold) {
+		/* Downward: jump directly to idx_hot (but not below floor) */
+		memcg->active_threshold = max_t(int, idx_hot, htmm_thres_hot);
+	} else if (idx_hot > memcg->active_threshold) {
+		/* 向上: 每次仅 +1，防止阈值跳变导致大规模错误降级 */
+		memcg->active_threshold++;
+	}
+	memcg->bp_active_threshold = idx_bp;
+	set_lru_adjusting(memcg, true);
+
+	if (memcg->need_split) {
+		set_memcg_nr_split(memcg);
+		set_memcg_split_thres(memcg);
+		memcg->nr_sampled_for_split = 0;
+		memcg->need_split = false;
 	}
 
 	/* set warm threshold */

@@ -1051,6 +1051,7 @@ static bool page_check_hotness_one(struct page *page,
 
 			cur_idx = pginfo->total_accesses;
 			cur_idx = get_idx(cur_idx);
+
 			if (cur_idx >= hca->memcg->active_threshold)
 				hca->page_is_hot = 2;
 			else
