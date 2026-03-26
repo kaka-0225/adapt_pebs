@@ -1,0 +1,37 @@
+=== GUPS Hotness Test (Single-Process + Placement Monitor) ===
+=== Test10: Hot region at 40%~60% of address space ===
+Updates:       7000000000
+Total memory:  45000 MB (43.95 GB)
+Element size:  8 bytes
+Total elems:   5898240000
+Hot region:    elems[2359296000..3538944000) = 1179648000 elems (9000.0 MB, addr 40%~60%)
+Cold region:   4718592000 elems (36000.0 MB, addr 0%~40% + 60%~100%)
+Access ratio:  hot 80% / cold 20%
+Placement check interval: every 1000000000 accesses
+Region: 0x400000000000 - 0x400afc800000
+Hot:    0x400465000000 - 0x400697800000
+Touching pages (first-touch allocation)...
+Page touch complete.
+[PLACEMENT #0] t=0.0s hot_pages=2304000  node0(DRAM)=330888(14.4%)  node2(PM)=1973112(85.6%)  other=0 err=0
+
+=== Starting GUPS (single process + placement monitor) ===
+[PLACEMENT #1] t=141.1s hot_pages=2304000  node0(DRAM)=343439(14.9%)  node2(PM)=1960561(85.1%)  other=0 err=0
+[PLACEMENT #2] t=260.6s hot_pages=2304000  node0(DRAM)=343439(14.9%)  node2(PM)=1960561(85.1%)  other=0 err=0
+[PLACEMENT #3] t=380.0s hot_pages=2304000  node0(DRAM)=343440(14.9%)  node2(PM)=1960560(85.1%)  other=0 err=0
+[PLACEMENT #4] t=499.4s hot_pages=2304000  node0(DRAM)=343440(14.9%)  node2(PM)=1960560(85.1%)  other=0 err=0
+[PLACEMENT #5] t=618.7s hot_pages=2304000  node0(DRAM)=343440(14.9%)  node2(PM)=1960560(85.1%)  other=0 err=0
+[PLACEMENT #6] t=738.0s hot_pages=2304000  node0(DRAM)=343446(14.9%)  node2(PM)=1960554(85.1%)  other=0 err=0
+[PLACEMENT #7] t=857.3s hot_pages=2304000  node0(DRAM)=343446(14.9%)  node2(PM)=1960554(85.1%)  other=0 err=0
+[PLACEMENT #8] t=857.5s hot_pages=2304000  node0(DRAM)=343446(14.9%)  node2(PM)=1960554(85.1%)  other=0 err=0
+
+=== Results ===
+Time:          857.451 seconds
+Updates:       7000000000
+GUPS:          0.008164
+Hot accesses:  5599928439 (80.0%)
+Cold accesses: 1400071561 (20.0%)
+Placement checks: 8
+
+[SUMMARY] GUPS=0.008164  Time=857.451  Updates=7000000000 HotPct=80.0 ColdPct=20.0 PlacementChecks=8
+pid: 10736
+execution time 905.44 (s)

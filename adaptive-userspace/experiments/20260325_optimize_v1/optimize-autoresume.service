@@ -1,0 +1,13 @@
+[Unit]
+Description=Optimize Compare Auto Resume after kexec
+After=network.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /mnt/sas_ssd/lyh/memtis-Nomad/adaptive-userspace/experiments/20260325_optimize_v1/optimize_resume.sh
+RemainAfterExit=no
+StandardOutput=append:/mnt/sas_ssd/lyh/memtis-Nomad/adaptive-userspace/experiments/20260325_optimize_v1/run.log
+StandardError=append:/mnt/sas_ssd/lyh/memtis-Nomad/adaptive-userspace/experiments/20260325_optimize_v1/run.log
+
+[Install]
+WantedBy=multi-user.target
