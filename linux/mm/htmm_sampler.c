@@ -12,7 +12,8 @@
 #include "../kernel/events/internal.h"
 
 #include <linux/htmm.h>
-#include <linux/math64.h> // 新增：内核 64 位除法支持
+#include <linux/math64.h> // 内核 64 位除法支持
+#include <linux/log2.h> // ilog2() 对数函数
 
 // Welford 算法的定点数缩放因子
 #define AP_SCALE_SHIFT 10 // 放大 1024 倍 (2^10)
@@ -75,37 +76,35 @@ static u32 heap_capacity = 1000;
 #define ADAPTIVE_SCALE 10000
 
 // 三个维度的归一化上限
-// 修复 #1: FLUC_MAX 适配真实方差量级（M2/n 比 M2 小约一个数量级）
-// 原值 2×10^16 是针对 M2；改用方差后上限缩小 10 倍，后续通过 trace 校准
 #define FLUC_MAX 2000000000000000ULL // 2×10^15，方差量级上限
-#define HIT_MAX 100 // 热度阈值（event_hit_count平均值上限）
-// 修复 #3: 调大窗口上限，避免正常工作负载下迅速饱和
-// 按 NVMREAD period=1007, CPU=40 估算：10s 内约 40*10*1e9/1007 ≈ 400K 次
-// 设为 200000，使正常采样不会轻易打到满分
-#define OVERHEAD_MAX 200000 // 开销阈值：单 Event 10s 窗口内采样数上限
+#define HIT_SATURATE 100 // ilog2饱和点：avg_hit超过此值后分数不再增长
 
 // 权重系数（定点数表示）
-static const s32 WEIGHT_VIBRATE = 4000; // 0.40 * ADAPTIVE_SCALE = 40%
-static const s32 WEIGHT_HOTNESS = 5000; // 0.50 * ADAPTIVE_SCALE = 50%
-static const s32 WEIGHT_OVERHEAD =
-	-1000; // -0.10 * ADAPTIVE_SCALE = -10%（负向惩罚）
+static const s32 WEIGHT_VIBRATE = 3000; // 0.30 * ADAPTIVE_SCALE = 30%
+static const s32 WEIGHT_RENEWAL = 4000; // 0.40 * ADAPTIVE_SCALE = 40%
+static const s32 WEIGHT_CONFIDENCE = 3000; // 0.30 * ADAPTIVE_SCALE = 30%
 
-// 全局开销计数器：统计每个Event的采样次数（用于V_overhead计算）
-// Phase 3.1: 去掉 static 使 mm/htmm_core.c 可以访问
-atomic64_t event_sample_counts[EVENT_TYPE_MAX];
+// 堆统计结构：用于计算V_renewal
+struct heap_stats {
+	u64 total_samples; // 本窗口总采样数
+	u64 heap_insertions; // 本窗口新页插入次数
+	u64 heap_replacements; // 本窗口堆顶替换次数
+};
+
+static struct heap_stats global_heap_stats[EVENT_TYPE_MAX];
 
 // 每个Event的自适应指标
 struct adaptive_metrics {
 	u32 vibrate_score; // 波动性分数 [0, 10000]
-	u32 hotness_score; // 热度分数 [0, 10000]
-	u32 overhead_score; // 开销分数 [0, 10000]
-	s32 V_raw; // 原始综合分数（可能为负）
+	u32 renewal_score; // 堆更新率分数 [0, 10000]
+	u32 confidence_score; // 对数饱和热度分数 [0, 10000]
+	s32 V_raw; // 原始综合分数
 	u32 V_normalized; // 归一化分数 [0, 10000]
 
-	// Phase 3.2 新增字段：Period自适应更新
-	u64 target_period; // 目标Period（从V_norm映射得到）
-	u64 current_period; // 当前Period（从硬件读取）
-	u64 new_period; // EMA平滑后的新Period
+	// Phase 3.2: Period自适应更新
+	u64 target_period;
+	u64 current_period;
+	u64 new_period;
 };
 
 // 全局自适应指标数组（9个Event）
@@ -125,8 +124,10 @@ static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
 #define MAX_PERIOD                                                             \
 	19997ULL // 对齐 pebs_period_list[29]（Baseline 最稀，避免超出 Baseline 曾达到的范围）
 
-// 全局开销预算
-#define GLOBAL_OVERHEAD_BUDGET 50000 // 每10秒最多采样50000次
+// 全局采样预算控制（优化1.1）
+#define MAX_SAMPLES_PER_WINDOW 2000000 // 10秒窗口最多200万次采样
+#define SCALE_UP_FACTOR 15 // Period放大系数：1.5倍
+#define SCALE_DOWN_FACTOR 10 // 分母
 
 // 更新周期
 #define ADAPTIVE_UPDATE_INTERVAL_SEC 10 // 10秒
@@ -149,8 +150,8 @@ static void pebs_disable(void);
 
 // Phase 3.1: 自适应公式函数声明
 static u32 calculate_vibrate_score(enum event_type type);
-static u32 calculate_hotness_score(enum event_type type);
-static u32 calculate_overhead_score(enum event_type type);
+static u32 calculate_renewal_score(enum event_type type);
+static u32 calculate_confidence_score(enum event_type type);
 static void calculate_adaptive_metrics(void);
 static void adaptive_metrics_init(void);
 
@@ -219,12 +220,14 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 	// } else {
 	// 	attr.sample_period = get_sample_period(0); // 199 fallback
 	// }
+	/* 初始Period从MAX_PERIOD开始，由adaptive timer逐步调低。
+	 * 避免从MIN_PERIOD=199启动时在EMA爬升期间采样过密导致soft lockup。
+	 * MEMWRITE保持原始配置值（100003）。
+	 */
 	if (type == MEMWRITE) {
 		attr.sample_period = htmm_inst_sample_period;
-	} else if (type == DRAMREAD || type == NVMREAD) {
-		attr.sample_period = htmm_sample_period;
 	} else {
-		attr.sample_period = htmm_sample_period; // fallback
+		attr.sample_period = 19997; /* MAX_PERIOD: 安全启动 */
 	}
 
 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR |
@@ -271,7 +274,7 @@ static int pebs_init(pid_t pid, int node)
 			sizeof(struct perf_event *) * N_HTMMEVENTS, GFP_KERNEL);
 	}
 
-	printk("pebs_init\n");
+	// printk("pebs_init\n");
 
 	for_each_online_cpu (cpu) {
 		for (event = 0; event < N_HTMMEVENTS; event++) {
@@ -342,7 +345,7 @@ static int pebs_init(pid_t pid, int node)
 static void pebs_disable(void)
 {
 	int cpu, event;
-	printk("pebs disable\n");
+	// printk("pebs disable\n");
 
 	// ========================================================================
 	// Phase 3.2: 停止周期性Period自适应更新定时器
@@ -405,7 +408,7 @@ static void pebs_enable(void)
 {
 	int cpu, event;
 
-	printk("pebs enable\n");
+	// printk("pebs enable\n");
 	for_each_online_cpu (cpu) {
 		for (event = 0; event < N_HTMMEVENTS; event++) {
 			if (mem_event[cpu][event])
@@ -589,6 +592,7 @@ static int ksamplingd(void *data)
 	unsigned long trace_runtime;
 	/* for timeout */
 	unsigned long sleep_timeout;
+	const struct cpumask *cpumask;
 
 	/* for analytic purpose */
 	unsigned long hr_dram = 0, hr_nvm = 0;
@@ -601,7 +605,7 @@ static int ksamplingd(void *data)
 
 	/* TODO implements per-CPU node ksamplingd by using pg_data_t */
 	/* Currently uses a single CPU node(0) */
-	const struct cpumask *cpumask = cpumask_of_node(0);
+	cpumask = cpumask_of_node(0);
 	if (!cpumask_empty(cpumask))
 		do_set_cpus_allowed(access_sampling, cpumask);
 
@@ -675,12 +679,8 @@ static int ksamplingd(void *data)
 					case PERF_RECORD_SAMPLE:
 						he = (struct htmm_event *)ph;
 
-						// ============================================================
-						// 🆕 新增：使用 trace_printk 记录 PEBS 采样
-						// Event 编号含义：
-						//   0=L1_HIT, 1=L1_MISS, 2=L2_HIT, 3=L2_MISS,
-						//   4=L3_HIT, 5=L3_MISS, 6=DRAMREAD, 7=NVMREAD, 8=MEMWRITE
-						// ============================================================
+						/* Event IDs: 0=L1_HIT, 1=L1_MISS, 2=L2_HIT, 3=L2_MISS,
+						 *             4=L3_HIT, 5=L3_MISS, 6=DRAMREAD, 7=NVMREAD, 8=MEMWRITE */
 
 						if (!valid_va(he->addr)) {
 							break;
@@ -732,6 +732,10 @@ static int ksamplingd(void *data)
 					smp_mb();
 					WRITE_ONCE(up->data_tail,
 						   up->data_tail + ph->size);
+
+					/* 避免长时间独占CPU导致soft lockup */
+					if (cond)
+						cond_resched();
 				} while (cond);
 			}
 		}
@@ -761,15 +765,32 @@ static int ksamplingd(void *data)
 						    elapsed_cputime);
 
 			/* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
-			/* Adaptive-PEBS: 当自适应定时器运行时，Period 由
-			 * adaptive_update_work_handler 独立控制，跳过此处的
-			 * CPU quota 全局覆盖，避免两个机制相互干扰。
+			/* Adaptive-PEBS: 当自适应定时器运行时，Period
+			 * 由 adaptive_update_work_handler 控制，此处
+			 * 仅作为硬上限安全网：CPU 超过 HARD_CPU_LIMIT
+			 * 时强制增加 Period 防止 soft lockup。
+			 * 不运行自适应定时器时保留原始双向调节逻辑。
 			 */
-			if (!adaptive_timer_running) {
+			if (adaptive_timer_running) {
+				/* 硬安全网：CPU > 5% 时强制增加Period */
+				if (cputime > 50 && sample_period != pcount) {
+					unsigned long tmp1 = sample_period,
+						      tmp2 = sample_inst_period;
+					increase_sample_period(
+						&sample_period,
+						&sample_inst_period);
+					if (tmp1 != sample_period ||
+					    tmp2 != sample_inst_period)
+						pebs_update_period(
+							get_sample_period(
+								sample_period),
+							get_sample_inst_period(
+								sample_inst_period));
+				}
+			} else {
 				if (cputime > (ksampled_soft_cpu_quota + 5) &&
 				    sample_period != pcount) {
 					/* need to increase the sample period */
-					/* only increase by 1 */
 					unsigned long tmp1 = sample_period,
 						      tmp2 = sample_inst_period;
 					increase_sample_period(
@@ -831,10 +852,10 @@ static int ksamplingd(void *data)
 	total_runtime = (t->se.sum_exec_runtime) - total_runtime; // ns
 	total_cputime = jiffies_to_usecs(jiffies - total_cputime); // us
 
-	printk("nr_sampled: %llu, nr_throttled: %llu, nr_lost: %llu\n",
-	       nr_sampled, nr_throttled, nr_lost);
-	printk("total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu\n",
-	       total_runtime, total_cputime, (total_runtime) / total_cputime);
+	// printk("nr_sampled: %llu, nr_throttled: %llu, nr_lost: %llu\n",
+	//        nr_sampled, nr_throttled, nr_lost);
+	// printk("total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu\n",
+	//        total_runtime, total_cputime, (total_runtime) / total_cputime);
 
 	return 0;
 }
@@ -977,7 +998,7 @@ static int heap_find(struct event_heap *heap, pginfo_t *pinfo)
 	return -1;
 }
 
-// 🆕 Adaptive-PEBS: 从event_id获取event_type枚举
+// Adaptive-PEBS: get event_type from event_id
 static enum event_type get_event_type_from_id(int event_id)
 {
 	switch (event_id) {
@@ -1004,8 +1025,9 @@ static enum event_type get_event_type_from_id(int event_id)
 	}
 }
 
-// 🆕 Adaptive-PEBS: 堆的更新或插入逻辑
-static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
+// Adaptive-PEBS: heap update/insert logic
+static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo,
+				  enum event_type type)
 {
 	int idx;
 	unsigned long flags;
@@ -1016,9 +1038,7 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
 	idx = heap_find(heap, pinfo);
 	if (idx >= 0) {
 		heap->entries[idx].event_hit_count++;
-		heap_sift_up(heap, idx); // 重新排序
-		// trace_printk("[Heap-Update] pinfo=%p new_hit=%u\n", pinfo,
-		// heap->entries[idx].event_hit_count);
+		heap_sift_up(heap, idx);
 		spin_unlock_irqrestore(&heap->lock, flags);
 		return;
 	}
@@ -1029,41 +1049,33 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo)
 		heap->entries[heap->size].event_hit_count = 1;
 		heap_sift_up(heap, heap->size);
 		heap->size++;
-		// trace_printk("[Heap-Insert] pinfo=%p heap_size=%d\n", pinfo,
-		// heap->size);
+		global_heap_stats[type].heap_insertions++;
 		spin_unlock_irqrestore(&heap->lock, flags);
 		return;
 	}
 
 	// 情况3: 堆已满 → 检查是否替换堆顶
-	// 修复 #5: 原条件 < 1 永远为 false（新页 hit=1 永不满足）
-	// 改为 <= 1：堆顶是冷页（hit ≤ 1）时用新页替换，引入新鲜血液
 	if (heap->entries[0].event_hit_count <= 1) {
-		// 堆顶是冷页，替换为新页
 		heap->entries[0].pinfo = pinfo;
 		heap->entries[0].event_hit_count = 1;
 		heap_sift_down(heap, 0);
-		// trace_printk("[Heap-Replace] pinfo=%p (evict cold top)\n",
-		// pinfo);
-	} else {
-		// 堆顶已被多次命中（hit > 1），新页热度不足，丢弃
-		// trace_printk(
-		// "[Heap-Discard] pinfo=%p (heap full, top_hit=%u)\n",
-		// pinfo, heap->entries[0].event_hit_count);
+		global_heap_stats[type].heap_replacements++;
 	}
 
 	spin_unlock_irqrestore(&heap->lock, flags);
 }
 
-// 🆕 Adaptive-PEBS: 从PEBS采样更新堆（被htmm_core.c调用）
+// Adaptive-PEBS: update heap from PEBS sample (called by htmm_core.c)
 void update_event_heap_from_sample(int event_id, pginfo_t *pinfo)
 {
-	if (event_id < 0 || event_id >= EVENT_TYPE_MAX) {
-		// trace_printk("[Heap-Error] Invalid event_id=%d\n", event_id);
-		return;
-	}
+	enum event_type type;
 
-	heap_update_or_insert(&global_event_heaps[event_id], pinfo);
+	if (event_id < 0 || event_id >= EVENT_TYPE_MAX)
+		return;
+
+	type = (enum event_type)event_id;
+	global_heap_stats[type].total_samples++;
+	heap_update_or_insert(&global_event_heaps[type], pinfo, type);
 }
 
 // ============================================================================
@@ -1129,193 +1141,123 @@ static u32 calculate_vibrate_score(enum event_type type)
 }
 
 /**
- * calculate_hotness_score - 计算热度分数（基于hit_count + 堆密度）
+ * calculate_renewal_score - 计算堆更新率分数
  * @type: Event类型
- * 
- * 算法：
- * 1. 遍历堆中所有页面，累加event_hit_count
- * 2. 计算平均热度 avg_hit = sum / count
- * 3. 计算堆密度加成 density_bonus = (heap->size * 100) / heap->capacity
- *    - 堆越满，说明热页越多，加成越大（0-100分）
- * 4. 基础分数：base_score = min(avg_hit * ADAPTIVE_SCALE / HIT_MAX, ADAPTIVE_SCALE)
- * 5. 最终分数：score = base_score + density_bonus（上限ADAPTIVE_SCALE）
- * 
+ *
+ * 算法：renewal_rate = (insertions + replacements) / total_samples
+ * 高更新率 = Event还在发现新热页 → 有价值
+ * 低更新率 = Event反复采样已知页面 → 边际收益低
+ *
+ * 返回：更新率分数 [0, 10000]
+ */
+static u32 calculate_renewal_score(enum event_type type)
+{
+	struct heap_stats *stats = &global_heap_stats[type];
+	u64 total = stats->total_samples;
+	u64 renewals = stats->heap_insertions + stats->heap_replacements;
+	u32 score;
+
+	if (total == 0)
+		return 0;
+
+	score = div64_u64(renewals * ADAPTIVE_SCALE, total);
+	return min_t(u32, score, ADAPTIVE_SCALE);
+}
+
+/**
+ * calculate_confidence_score - 计算对数饱和热度分数
+ * @type: Event类型
+ *
+ * 算法：score = ilog2(avg_hit + 1) * ADAPTIVE_SCALE / ilog2(HIT_SATURATE + 1)
+ * 使用对数曲线实现"够了就行"：
+ * - hit=1→10: 分数快速上升（确认热度阶段）
+ * - hit=50→500: 分数增长很慢（已饱和，多采无益）
+ *
  * 返回：热度分数 [0, 10000]
  */
-static u32 calculate_hotness_score(enum event_type type)
+static u32 calculate_confidence_score(enum event_type type)
 {
 	struct event_heap *heap = &global_event_heaps[type];
 	u64 sum_hit_count = 0;
 	u32 count = 0;
-	u32 i;
-	u64 avg_hit;
-	u32 base_score;
-	u32 density_bonus;
-	u32 final_score;
+	u32 avg_hit, score;
+	int i;
 
-	if (!heap || heap->size == 0) {
-		return 0; // 空堆返回0分
-	}
+	if (!heap || heap->size == 0)
+		return 0;
 
-	// 遍历堆中所有页面，累加hit_count
 	for (i = 0; i < heap->size; i++) {
-		struct heap_entry *entry = &heap->entries[i];
-		sum_hit_count += entry->event_hit_count;
+		sum_hit_count += heap->entries[i].event_hit_count;
 		count++;
 	}
 
-	if (count == 0) {
+	if (count == 0)
 		return 0;
-	}
 
-	// 计算平均热度
-	avg_hit = div64_u64(sum_hit_count, (u64)count);
+	avg_hit = div_u64(sum_hit_count, count);
 
-	// 基础分数：归一化到 [0, ADAPTIVE_SCALE]
-	if (avg_hit >= HIT_MAX) {
-		base_score = ADAPTIVE_SCALE;
-	} else {
-		base_score =
-			(u32)div64_u64(avg_hit * ADAPTIVE_SCALE, (u64)HIT_MAX);
-	}
+	if (avg_hit == 0)
+		return 0;
 
-	// 堆密度加成：堆越满，热页越多（0-100分）
-	// density_bonus = (heap->size * 100) / heap->capacity
-	if (heap->capacity > 0) {
-		density_bonus = (heap->size * 100) / heap->capacity;
-	} else {
-		density_bonus = 0;
-	}
+	// ilog2(101) = 6, 为了更平滑使用7作为除数
+	score = ilog2(avg_hit + 1) * ADAPTIVE_SCALE / 7;
 
-	// 最终分数 = 基础分数 + 密度加成（上限10000）
-	final_score = base_score + density_bonus;
-	if (final_score > ADAPTIVE_SCALE) {
-		final_score = ADAPTIVE_SCALE;
-	}
-
-	return final_score;
-}
-
-/**
- * calculate_overhead_score - 计算开销分数（基于采样计数）
- * @type: Event类型
- * 
- * 算法：
- * 1. 读取event_sample_counts[type]（每次update_base_page时递增）
- * 2. 归一化：score = min(count * ADAPTIVE_SCALE / OVERHEAD_MAX, ADAPTIVE_SCALE)
- * 3. 注意：这是负向指标，最终会乘以负权重
- * 
- * 返回：开销分数 [0, 10000]
- */
-static u32 calculate_overhead_score(enum event_type type)
-{
-	u64 sample_count;
-	u64 score;
-
-	// 读取采样计数
-	sample_count = atomic64_read(&event_sample_counts[type]);
-
-	// 归一化到 [0, ADAPTIVE_SCALE]
-	if (sample_count >= OVERHEAD_MAX) {
-		score = ADAPTIVE_SCALE;
-	} else {
-		score = div64_u64(sample_count * ADAPTIVE_SCALE,
-				  (u64)OVERHEAD_MAX);
-	}
-
-	return (u32)score;
+	return min_t(u32, score, ADAPTIVE_SCALE);
 }
 
 /**
  * calculate_adaptive_metrics - 综合计算所有Event的自适应分数
- * 
- * Phase 3.1功能：计算三维度分数并归一化到[0,10000]
- * Phase 3.2会在delayed_work中周期性调用此函数，根据分数更新Period
- * 
- * 算法：
- * 1. 遍历9个Event，分别计算三个维度分数
- * 2. 计算原始分数：V_raw = β·V_vibrate + γ·V_hotness + δ·V_overhead
- * 3. 归一化到[0, ADAPTIVE_SCALE]：
- *    - V_min = -1000 (最差情况：振动0，热度0，开销满10000)
- *    - V_max = 9000 (最好情况：振动满10000，热度满10000，开销0)
- *    - V_normalized = (V_raw - V_min) * ADAPTIVE_SCALE / (V_max - V_min)
- * 4. 通过trace_printk输出每个Event的分数（Phase 3.1验证用）
+ *
+ * 新公式：V = 0.3×V_vibrate + 0.4×V_renewal + 0.3×V_confidence
+ * 无负权重，V_raw范围 [0, 10000]
  */
 static void calculate_adaptive_metrics(void)
 {
 	enum event_type type;
-	s32 V_min = -1000; // 最小可能分数 = 0*4000 + 0*5000 + 10000*(-1000)
-	s32 V_max =
-		9000; // 最大可能分数 = 10000*4000 + 10000*5000 + 0*(-1000) = 90000000 / 10000 = 9000
-	s32 V_range = V_max - V_min; // 10000
-	//
-	// trace_printk(
-	// "[Adaptive-Start] ===== Calculate Adaptive Metrics =====\n");
 
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
-		struct adaptive_metrics *metrics =
-			&global_adaptive_metrics[type];
-		u32 vibrate, hotness, overhead;
+		struct adaptive_metrics *m = &global_adaptive_metrics[type];
+		u32 vibrate, renewal, confidence;
 		s64 V_raw_calc;
-		s32 V_raw;
-		s64 V_norm_calc;
 
-		// Step 1: 计算三个维度分数
+		// 计算三个维度分数
 		vibrate = calculate_vibrate_score(type);
-		hotness = calculate_hotness_score(type);
-		overhead = calculate_overhead_score(type);
+		renewal = calculate_renewal_score(type);
+		confidence = calculate_confidence_score(type);
 
 		// 保存到metrics结构
-		metrics->vibrate_score = vibrate;
-		metrics->hotness_score = hotness;
-		metrics->overhead_score = overhead;
+		m->vibrate_score = vibrate;
+		m->renewal_score = renewal;
+		m->confidence_score = confidence;
 
-		// Step 2: 计算原始综合分数（定点数运算）
-		// V_raw = (β·V_vibrate + γ·V_hotness + δ·V_overhead) / ADAPTIVE_SCALE
-		// 注意：WEIGHT_OVERHEAD是负数
+		// 综合分数（无负权重）
 		V_raw_calc = ((s64)WEIGHT_VIBRATE * vibrate +
-			      (s64)WEIGHT_HOTNESS * hotness +
-			      (s64)WEIGHT_OVERHEAD * overhead) /
+			      (s64)WEIGHT_RENEWAL * renewal +
+			      (s64)WEIGHT_CONFIDENCE * confidence) /
 			     ADAPTIVE_SCALE;
-		V_raw = (s32)V_raw_calc;
-		metrics->V_raw = V_raw;
+		m->V_raw = (s32)V_raw_calc;
 
-		// Step 3: 归一化到[0, ADAPTIVE_SCALE]
-		// V_normalized = (V_raw - V_min) * ADAPTIVE_SCALE / V_range
-		if (V_raw <= V_min) {
-			metrics->V_normalized = 0;
-		} else if (V_raw >= V_max) {
-			metrics->V_normalized = ADAPTIVE_SCALE;
-		} else {
-			V_norm_calc = ((s64)(V_raw - V_min) * ADAPTIVE_SCALE) /
-				      V_range;
-			metrics->V_normalized = (u32)V_norm_calc;
-		}
+		// 直接使用V_raw作为归一化分数（范围已在[0,10000]）
+		m->V_normalized = min_t(u32, (u32)m->V_raw, ADAPTIVE_SCALE);
 
-		// Step 4: 输出调试信息（Phase 3.1验证用）
-		// trace_printk(
-		// "[Adaptive-Score] Event=%d Vibrate=%u Hotness=%u Overhead=%u V_raw=%d V_norm=%u\n",
-		// type, vibrate, hotness, overhead, V_raw,
-		// metrics->V_normalized);
+		trace_printk(
+			"[Adaptive-Score] Event=%d vibrate=%u renewal=%u confidence=%u V_norm=%u\n",
+			type, vibrate, renewal, confidence, m->V_normalized);
 	}
-	//
-	// trace_printk("[Adaptive-Final] ===== Calculation Complete =====\n");
 }
 
 /**
  * adaptive_metrics_init - 初始化自适应指标系统
- * 
- * 在pebs_init时调用，初始化：
- * 1. event_sample_counts数组（开销计数器）
- * 2. global_adaptive_metrics数组（分数存储）
  */
 static void adaptive_metrics_init(void)
 {
 	enum event_type type;
 
-	// 初始化开销计数器
+	// 初始化堆统计
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
-		atomic64_set(&event_sample_counts[type], 0);
+		global_heap_stats[type].total_samples = 0;
+		global_heap_stats[type].heap_insertions = 0;
+		global_heap_stats[type].heap_replacements = 0;
 	}
 
 	// 初始化自适应指标
@@ -1489,7 +1431,7 @@ void adaptive_update_work_handler(struct work_struct *work)
 {
 	enum event_type type;
 
-	printk(KERN_INFO "[HTMM-Adaptive] Timer callback triggered\n");
+	// printk(KERN_INFO "[HTMM-Adaptive] Timer callback triggered\n");
 	// trace_printk("[Adaptive-Update] ===== Periodic update triggered =====\n");
 
 	// -----------------------------------------------------------------------
@@ -1524,14 +1466,37 @@ void adaptive_update_work_handler(struct work_struct *work)
 		}
 	}
 
-	// 计算最新的自适应分数
-	// trace_printk("[Adaptive-Update] Calculating current metrics...\n");
+	// 先计算指标（使用本窗口累积的统计数据）
 	calculate_adaptive_metrics();
 
-	// 修复 #3：重置开销计数器，使 overhead 反映当前 10s 窗口的实时采样率
-	// 必须在 calculate_adaptive_metrics() 之后重置，避免本轮分数丢失
-	for (type = 0; type < EVENT_TYPE_MAX; type++)
-		atomic64_set(&event_sample_counts[type], 0);
+	// 优化1.1：全局采样预算控制
+	// 如果总采样量超过预算，统一放大所有Event的Period
+	{
+		u64 total_samples = 0;
+		u64 cur_period, scaled;
+
+		for (type = 0; type < EVENT_TYPE_MAX; type++)
+			total_samples += global_heap_stats[type].total_samples;
+
+		if (total_samples > MAX_SAMPLES_PER_WINDOW) {
+			for (type = 0; type < EVENT_TYPE_MAX; type++) {
+				cur_period = get_current_period(type);
+				scaled = cur_period * SCALE_UP_FACTOR /
+					 SCALE_DOWN_FACTOR;
+				scaled = min_t(u64, scaled, MAX_PERIOD);
+				update_pebs_event_period(type, scaled);
+			}
+			// 预算超限，跳过本轮自适应调整
+			goto reschedule;
+		}
+	}
+
+	// 重置堆统计窗口（在指标计算和预算检查之后）
+	for (type = 0; type < EVENT_TYPE_MAX; type++) {
+		global_heap_stats[type].total_samples = 0;
+		global_heap_stats[type].heap_insertions = 0;
+		global_heap_stats[type].heap_replacements = 0;
+	}
 
 	// 遍历所有Event类型
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
@@ -1565,14 +1530,14 @@ void adaptive_update_work_handler(struct work_struct *work)
 
 		// 5. 更新硬件Period
 		update_pebs_event_period(type, new_period);
-		//
-		// trace_printk(
-		// "[Adaptive-Period] Event %d: Period updated %llu → %llu (EMA smoothed)\n",
-		// type, current_period, new_period);
-	}
-	//
-	// trace_printk("[Adaptive-Update] ===== Update completed =====\n");
 
+		trace_printk(
+			"[Adaptive-Period] Event=%d period=%llu->%llu target=%llu score=%llu\n",
+			type, current_period, new_period, target_period,
+			current_score);
+	}
+
+reschedule:
 	// 重新调度下一次定时器 (10秒后)
 	if (adaptive_timer_running) {
 		schedule_delayed_work(
@@ -1633,9 +1598,9 @@ int ksamplingd_init(pid_t pid, int node)
 
 void ksamplingd_exit(void)
 {
+	pebs_disable();
 	if (access_sampling) {
 		kthread_stop(access_sampling);
 		access_sampling = NULL;
 	}
-	pebs_disable();
 }

@@ -395,6 +395,8 @@ struct mem_cgroup {
 	/* etc */
 	int cooled; /* >0: post-cooling stabilization periods remaining */
 	bool split_happen;
+	/* 优化2.2：跟踪最近的promote次数，用于动态调整promote阈值 */
+	unsigned long recent_promote_count;
 	bool need_split;
 	unsigned int cooling_clock;
 	unsigned long nr_alloc;

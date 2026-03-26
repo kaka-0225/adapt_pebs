@@ -873,16 +873,10 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 	unsigned long prev_accessed, prev_idx, cur_idx;
 	bool hot;
 
-	// 🆕 Phase 3.1: 统计Event采样开销
-	if (event_id >= 0 && event_id < 9) {
-		extern atomic64_t event_sample_counts[9];
-		atomic64_inc(&event_sample_counts[event_id]);
-	}
-
-	// 🆕 Adaptive-PEBS: 更新 Welford 在线方差
+	// Adaptive-PEBS: update Welford online variance
 	update_page_fluctuation(pginfo, timestamp);
 
-	// 🆕 Adaptive-PEBS: 更新全局Event堆
+	// Adaptive-PEBS: update global event heap
 	update_event_heap_from_sample(event_id, pginfo);
 
 	/* check cooling status and perform cooling if the page needs to be cooled */
@@ -1256,6 +1250,10 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 	/* B-fix: extend post-cooling gradual threshold for entire cooling cycle
 	 * to prevent threshold jump that abandons unsampled hot pages */
 	memcg->cooled = htmm_cooling_period / htmm_adaptation_period;
+
+	/* 优化2.2：重置promote计数器 */
+	memcg->recent_promote_count = 0;
+
 	smp_mb();
 	spin_unlock(&memcg->access_lock);
 	set_lru_cooling(mm);
@@ -1488,10 +1486,10 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e,
 					set_memcg_split_thres(memcg);
 				}
 			}
-			printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu \n",
-			       memcg->nr_max_sampled,
-			       memcg->prev_max_dram_sampled,
-			       memcg->prev_dram_sampled);
+			// printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu \n",
+			//        memcg->nr_max_sampled,
+			//        memcg->prev_max_dram_sampled,
+			//        memcg->prev_dram_sampled);
 			memcg->nr_max_sampled >>= 1;
 		}
 	}

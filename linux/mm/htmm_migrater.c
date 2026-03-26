@@ -19,6 +19,9 @@
 
 #include "internal.h"
 
+// 优化1.2：Promote速率限制
+#define MAX_PROMOTE_PER_ROUND 5000  // 每轮最多promote 5000页
+
 #define MIN_WATERMARK_LOWER_LIMIT 128 * 100 // 50MB
 #define MIN_WATERMARK_UPPER_LIMIT 2560 * 100 // 1000MB
 #define MAX_WATERMARK_LOWER_LIMIT 256 * 100 // 100MB
@@ -378,10 +381,10 @@ static unsigned long migrate_page_list(struct list_head *migrate_list,
 			if (PageAnon(__page)) {
 				unsigned long va = (unsigned long)__page->index
 						   << PAGE_SHIFT;
-				trace_printk(
-					"[MIGRATE] dir=%c va=0x%lx src=%d dst=%d\n",
-					promotion ? 'P' : 'D', va,
-					page_to_nid(__page), target_nid);
+				// trace_printk(
+				// 	"[MIGRATE] dir=%c va=0x%lx src=%d dst=%d\n",
+				// 	promotion ? 'P' : 'D', va,
+				// 	page_to_nid(__page), target_nid);
 			}
 		}
 	}
@@ -471,11 +474,24 @@ static unsigned long promote_page_list(struct list_head *page_list,
 	LIST_HEAD(promote_pages);
 	LIST_HEAD(ret_pages);
 	unsigned long nr_promoted = 0;
+	u32 promote_threshold;
 
 	cond_resched();
 
+	/* 优化2.2：基于最近Promote速率的动态阈值 */
+	promote_threshold = memcg->active_threshold;
+	if (memcg->recent_promote_count > 10000) {
+		promote_threshold = memcg->active_threshold + 1;
+	}
+
 	while (!list_empty(page_list)) {
 		struct page *page;
+
+		// 优化1.2：Promote速率限制
+		if (nr_promoted >= MAX_PROMOTE_PER_ROUND) {
+			// 剩余页面放回列表，下次再处理
+			break;
+		}
 
 		page = lru_to_page(page_list);
 		list_del(&page->lru);
@@ -496,12 +512,12 @@ static unsigned long promote_page_list(struct list_head *page_list,
 			if (PageTransHuge(page)) {
 				struct page *meta = get_meta_page(page);
 
-				if (meta->idx < memcg->active_threshold)
+				if (meta->idx < promote_threshold)
 					goto __keep_locked;
 			} else {
 				int idx = get_pginfo_idx(page);
 
-				if (idx < (int)memcg->active_threshold)
+				if (idx < (int)promote_threshold)
 					goto __keep_locked;
 			}
 		}
@@ -520,6 +536,10 @@ static unsigned long promote_page_list(struct list_head *page_list,
 		list_splice(&promote_pages, page_list);
 
 	list_splice(&ret_pages, page_list);
+
+	/* 优化2.2：更新最近的promote计数 */
+	memcg->recent_promote_count += nr_promoted;
+
 	return nr_promoted;
 }
 
