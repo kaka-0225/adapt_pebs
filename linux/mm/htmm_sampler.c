@@ -66,7 +66,9 @@ enum event_type {
 static struct event_heap global_event_heaps[EVENT_TYPE_MAX];
 
 // 堆容量配置（后续可通过sysfs调整）
-static u32 heap_capacity = 1000;
+// F6-fix: 增大 heap 容量以提高 renewal 指标的灵敏度
+// 10000 条内存开销：10000 × 16B × 9 events = 1.44MB（可接受）
+static u32 heap_capacity = 10000;
 
 // ============================================================================
 // Phase 3.1: 自适应公式数据结构（Adaptive Metrics）
@@ -81,8 +83,10 @@ static u32 heap_capacity = 1000;
 
 // 权重系数（定点数表示）
 static const s32 WEIGHT_VIBRATE = 3000; // 0.30 * ADAPTIVE_SCALE = 30%
-static const s32 WEIGHT_RENEWAL = 4000; // 0.40 * ADAPTIVE_SCALE = 40%
-static const s32 WEIGHT_CONFIDENCE = 3000; // 0.30 * ADAPTIVE_SCALE = 30%
+static const s32 WEIGHT_RENEWAL =
+	2000; // 0.20 * ADAPTIVE_SCALE = 20% (F10: 0.4→0.2)
+static const s32 WEIGHT_CONFIDENCE =
+	5000; // 0.50 * ADAPTIVE_SCALE = 50% (F10: 0.3→0.5)
 
 // 堆统计结构：用于计算V_renewal
 struct heap_stats {
@@ -124,6 +128,10 @@ static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
 #define MAX_PERIOD                                                             \
 	19997ULL // 对齐 pebs_period_list[29]（Baseline 最稀，避免超出 Baseline 曾达到的范围）
 
+// F2-fix: 初始 Period 使用中间值，避免 MIN 的启动风暴和 MAX 的冷启动陷阱
+// pebs_period_list[15] = 3001：比 MIN(199) 低 15 倍采样率，比 MAX(19997) 高 6.6 倍
+#define INIT_PERIOD 3001ULL
+
 // 全局采样预算控制（优化1.1）
 #define MAX_SAMPLES_PER_WINDOW 2000000 // 10秒窗口最多200万次采样
 #define SCALE_UP_FACTOR 15 // Period放大系数：1.5倍
@@ -137,6 +145,10 @@ static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
 // 定时器
 static struct delayed_work adaptive_update_work;
 static bool adaptive_timer_running = false;
+
+// Bug Fix #6: 内部Period跟踪数组
+// 避免读取event->attr.sample_period（可能被perf throttle篡改）
+static u64 tracked_periods[EVENT_TYPE_MAX];
 
 // ============================================================================
 // 函数前向声明
@@ -220,14 +232,17 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 	// } else {
 	// 	attr.sample_period = get_sample_period(0); // 199 fallback
 	// }
-	/* 初始Period从MAX_PERIOD开始，由adaptive timer逐步调低。
-	 * 避免从MIN_PERIOD=199启动时在EMA爬升期间采样过密导致soft lockup。
-	 * MEMWRITE保持原始配置值（100003）。
+	/* F2-fix: 初始Period使用中间值INIT_PERIOD=3001
+	 * 原Bug Fix #7用MIN_PERIOD=199导致启动风暴→heap秒满→renewal=0→死亡螺旋。
+	 * 原代码用MAX_PERIOD=19997导致冷启动陷阱→无采样→adaptive无意义。
+	 * INIT_PERIOD=3001(pebs_period_list[15])平衡两端：
+	 *   10秒内~3.3万次采样，足够启动但不会淹没heap。
+	 * MEMWRITE保持原始配置值。
 	 */
 	if (type == MEMWRITE) {
 		attr.sample_period = htmm_inst_sample_period;
 	} else {
-		attr.sample_period = 19997; /* MAX_PERIOD: 安全启动 */
+		attr.sample_period = INIT_PERIOD; /* 3001: 中间值启动 */
 	}
 
 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR |
@@ -259,7 +274,8 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 		printk("invalid file\n");
 		return -1;
 	}
-	mem_event[cpu][type] = fget(event_fd)->private_data;
+	/* Bug Fix #11: 原来调用了两次fget，泄漏了第一次的文件引用计数 */
+	mem_event[cpu][type] = file->private_data;
 	return 0;
 }
 
@@ -554,7 +570,14 @@ void update_page_fluctuation(pginfo_t *pinfo, u64 now)
 	// 步骤 5.4：M2_n = M2_{n-1} + delta * delta2
 	// 注意：delta * delta2 会放大到 1024*1024 = 2^20 倍
 	//       右移 AP_SCALE_SHIFT 恢复到 1024 倍精度
-	pinfo->fluctuation += (u64)((delta * delta2) >> AP_SCALE_SHIFT);
+	/* Bug Fix #10: Welford算法中delta*delta2数学上恒非负，
+	 * 但整数除法截断可能导致微小负值，
+	 * 强转为u64会下溢回绕为巨大正数污染fluctuation。 */
+	{
+		s64 m2_delta = (delta * delta2) >> AP_SCALE_SHIFT;
+		if (m2_delta > 0)
+			pinfo->fluctuation += (u64)m2_delta;
+	}
 
 	// ========== 【核心 trace_printk】：汇总所有字段数值 ==========
 	// 这是最重要的日志，用于离线分析各字段的位数是否合适
@@ -618,6 +641,8 @@ static int ksamplingd(void *data)
 		}
 
 		for_each_online_cpu (cpu) {
+			if (kthread_should_stop())
+				break;
 			for (event = 0; event < N_HTMMEVENTS; event++) {
 				do {
 					struct perf_buffer *rb;
@@ -736,6 +761,10 @@ static int ksamplingd(void *data)
 					/* 避免长时间独占CPU导致soft lockup */
 					if (cond)
 						cond_resched();
+					/* Bug Fix #13: 内循环也检查stop信号，
+					 * 防止ring buffer残留数据导致无限循环 */
+					if (kthread_should_stop())
+						break;
 				} while (cond);
 			}
 		}
@@ -772,20 +801,26 @@ static int ksamplingd(void *data)
 			 * 不运行自适应定时器时保留原始双向调节逻辑。
 			 */
 			if (adaptive_timer_running) {
-				/* 硬安全网：CPU > 5% 时强制增加Period */
-				if (cputime > 50 && sample_period != pcount) {
-					unsigned long tmp1 = sample_period,
-						      tmp2 = sample_inst_period;
-					increase_sample_period(
-						&sample_period,
-						&sample_inst_period);
-					if (tmp1 != sample_period ||
-					    tmp2 != sample_inst_period)
-						pebs_update_period(
-							get_sample_period(
-								sample_period),
-							get_sample_inst_period(
-								sample_inst_period));
+				/* F3-fix: 恢复 CPU cap 安全阀
+				 * CPU 超限时放大 tracked_periods[]，
+				 * adaptive timer 下次回调以新基准值做 EMA。
+				 * 不直接调用 pebs_update_period() 避免与
+				 * adaptive timer 的 EMA 逻辑冲突。 */
+				if (cputime > (ksampled_soft_cpu_quota + 5)) {
+					enum event_type etype;
+					for (etype = 0; etype < EVENT_TYPE_MAX;
+					     etype++) {
+						u64 cur_p =
+							tracked_periods[etype];
+						if (cur_p == 0)
+							continue;
+						cur_p = cur_p *
+							SCALE_UP_FACTOR /
+							SCALE_DOWN_FACTOR;
+						if (cur_p > MAX_PERIOD)
+							cur_p = MAX_PERIOD;
+						tracked_periods[etype] = cur_p;
+					}
 				}
 			} else {
 				if (cputime > (ksampled_soft_cpu_quota + 5) &&
@@ -1038,7 +1073,10 @@ static void heap_update_or_insert(struct event_heap *heap, pginfo_t *pinfo,
 	idx = heap_find(heap, pinfo);
 	if (idx >= 0) {
 		heap->entries[idx].event_hit_count++;
-		heap_sift_up(heap, idx);
+		/* Bug Fix #9: hit_count增大后应向下调整（sift_down）而非sift_up。
+		 * 这是最小堆，值增大可能违反"父≤子"约束的下半部分，
+		 * 原来用sift_up会立即停止，导致堆性质被破坏。 */
+		heap_sift_down(heap, idx);
 		spin_unlock_irqrestore(&heap->lock, flags);
 		return;
 	}
@@ -1155,12 +1193,27 @@ static u32 calculate_renewal_score(enum event_type type)
 	struct heap_stats *stats = &global_heap_stats[type];
 	u64 total = stats->total_samples;
 	u64 renewals = stats->heap_insertions + stats->heap_replacements;
+	struct event_heap *heap = &global_event_heaps[type];
+	u32 cap = (heap->capacity > 0) ? heap->capacity : 1;
 	u32 score;
 
 	if (total == 0)
 		return 0;
 
-	score = div64_u64(renewals * ADAPTIVE_SCALE, total);
+	/* F8-fix: 分母改为 heap_capacity（堆翻转率），而非 total_samples（采样命中率）。
+	 * 旧公式在大工作集(>>heap_capacity)下 renewals≈total → score≈100%锁死。
+	 * 新公式：score = renewals / capacity，受堆大小约束。 */
+	score = div64_u64(renewals * ADAPTIVE_SCALE, (u64)cap);
+
+	/* F7-fix: renewal 下限保护
+	 * heap 已满且有采样活动但无新发现时，设置 5% 下限。
+	 * 防止均匀访问模式下 V_norm 永久归零导致 period 冻结。
+	 * 5% 贡献 V_renewal = 500×0.4 = 200，对应 period ≈ 19000 */
+	if (score == 0 && total > 0) {
+		if (heap->size >= heap->capacity)
+			score = ADAPTIVE_SCALE / 20; /* 5% 下限 */
+	}
+
 	return min_t(u32, score, ADAPTIVE_SCALE);
 }
 
@@ -1262,8 +1315,17 @@ static void adaptive_metrics_init(void)
 
 	// 初始化自适应指标
 	memset(global_adaptive_metrics, 0, sizeof(global_adaptive_metrics));
-	//
-	// trace_printk("[Adaptive-Init] Adaptive metrics system initialized\n");
+
+	// Bug Fix #6: 初始化内部Period跟踪，与pebs_init中__perf_event_open的初始值对齐
+	for (type = 0; type < EVENT_TYPE_MAX; type++) {
+		if (type == EVENT_MEM_WRITE)
+			tracked_periods[type] = htmm_inst_sample_period;
+		else if (type == EVENT_DRAM_READ || type == EVENT_NVM_READ)
+			tracked_periods[type] = INIT_PERIOD; /* F2-fix */
+		else
+			tracked_periods[type] = 0; /* 禁用的Event */
+	}
+
 	// ========================================================================
 	// Phase 3.2: 启动周期性Period自适应更新定时器
 	// ========================================================================
@@ -1346,37 +1408,21 @@ static u64 apply_ema_to_period(u64 current_period, u64 target_period)
 }
 
 /**
- * get_current_period - 从perf_event读取当前Period
+ * get_current_period - 返回内部跟踪的当前Period
  * @type: Event类型
  * 
- * 返回：当前Period，失败返回0
+ * Bug Fix #6: 使用内部tracked_periods而非读取event->attr.sample_period。
+ * perf subsystem的throttle机制可能篡改attr.sample_period，
+ * 导致读到异常值（如300007、293）。
+ * 内部跟踪确保返回的是我们上次主动设置的值。
  * 
- * 遍历所有CPU，找到第一个匹配的Event并读取其Period
+ * 返回：当前Period，失败返回0
  */
 static u64 get_current_period(enum event_type type)
 {
-	int cpu;
-	int event_idx;
-	u64 period = 0;
-
-	// 遍历所有CPU，找到第一个匹配的Event
-	for_each_online_cpu (cpu) {
-		if (!mem_event || !mem_event[cpu])
-			continue;
-
-		for (event_idx = 0; event_idx < N_HTMMEVENTS; event_idx++) {
-			if (get_event_type_from_id(event_idx) == type) {
-				struct perf_event *event =
-					mem_event[cpu][event_idx];
-				if (event) {
-					period = event->attr.sample_period;
-					return period; // 返回第一个找到的
-				}
-			}
-		}
-	}
-
-	return period;
+	if (type >= EVENT_TYPE_MAX)
+		return 0;
+	return tracked_periods[type];
 }
 
 /**
@@ -1390,6 +1436,10 @@ static u64 get_current_period(enum event_type type)
 static void update_pebs_event_period(enum event_type type, u64 new_period)
 {
 	int cpu, event_idx;
+
+	/* Bug Fix #6: 更新内部跟踪 */
+	if (type < EVENT_TYPE_MAX)
+		tracked_periods[type] = new_period;
 
 	// 遍历所有CPU
 	for_each_online_cpu (cpu) {
@@ -1450,11 +1500,14 @@ void adaptive_update_work_handler(struct work_struct *work)
 
 			spin_lock_irqsave(&heap->lock, heap_flags);
 
-			// 对每个页面的 hit_count 乘以 7/10（衰减 30%）
+			/* F9-fix: 老化因子从 ×0.7 改为 ×0.85
+			 * ×0.7 衰减太快：hit=100 经12轮(120s)即降至1，热页难以维持。
+			 * ×0.85：hit=100 经28轮(280s)降至1，热页存活所需采样频率减半。
+			 * 效果：堆更稳定 → replacements↓ → renewal score↓ */
 			for (heap_i = 0; heap_i < heap->size; heap_i++)
 				heap->entries[heap_i].event_hit_count =
 					heap->entries[heap_i].event_hit_count *
-					7 / 10;
+					85 / 100;
 
 			// Floyd 建堆：从最后一个非叶子节点向上重建最小堆性质
 			if (heap->size > 1) {
@@ -1469,18 +1522,29 @@ void adaptive_update_work_handler(struct work_struct *work)
 	// 先计算指标（使用本窗口累积的统计数据）
 	calculate_adaptive_metrics();
 
-	// 优化1.1：全局采样预算控制
-	// 如果总采样量超过预算，统一放大所有Event的Period
+	// Bug Fix #8: 先保存总采样数，然后立即重置统计窗口
+	// 原来budget超限时goto reschedule跳过了stats reset，导致统计跨窗口累积
 	{
-		u64 total_samples = 0;
+		u64 window_total_samples = 0;
 		u64 cur_period, scaled;
 
 		for (type = 0; type < EVENT_TYPE_MAX; type++)
-			total_samples += global_heap_stats[type].total_samples;
+			window_total_samples +=
+				global_heap_stats[type].total_samples;
 
-		if (total_samples > MAX_SAMPLES_PER_WINDOW) {
+		// 立即重置统计窗口（无论是否超过预算）
+		for (type = 0; type < EVENT_TYPE_MAX; type++) {
+			global_heap_stats[type].total_samples = 0;
+			global_heap_stats[type].heap_insertions = 0;
+			global_heap_stats[type].heap_replacements = 0;
+		}
+
+		// 预算控制：如果总采样量超过预算，统一放大所有Event的Period
+		if (window_total_samples > MAX_SAMPLES_PER_WINDOW) {
 			for (type = 0; type < EVENT_TYPE_MAX; type++) {
 				cur_period = get_current_period(type);
+				if (cur_period == 0)
+					continue; /* 跳过禁用的Event */
 				scaled = cur_period * SCALE_UP_FACTOR /
 					 SCALE_DOWN_FACTOR;
 				scaled = min_t(u64, scaled, MAX_PERIOD);
@@ -1491,13 +1555,6 @@ void adaptive_update_work_handler(struct work_struct *work)
 		}
 	}
 
-	// 重置堆统计窗口（在指标计算和预算检查之后）
-	for (type = 0; type < EVENT_TYPE_MAX; type++) {
-		global_heap_stats[type].total_samples = 0;
-		global_heap_stats[type].heap_insertions = 0;
-		global_heap_stats[type].heap_replacements = 0;
-	}
-
 	// 遍历所有Event类型
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
 		struct adaptive_metrics *metrics =
@@ -1506,29 +1563,24 @@ void adaptive_update_work_handler(struct work_struct *work)
 
 		// 1. 读取当前分数
 		current_score = metrics->V_normalized;
+
+		// F1-fix: V_norm=0 时不再跳过，而是将 target 设为 MAX_PERIOD
+		// EMA 平滑确保 period 逐步增大（每10秒窗口靠近30%），而非冻结
 		if (current_score == 0) {
-			// trace_printk(
-			// "[Adaptive-Update] Event %d: score=0, skipping\n",
-			// type);
-			continue;
+			target_period = MAX_PERIOD;
+		} else {
+			target_period = map_score_to_period((u32)current_score);
 		}
 
-		// 2. 计算目标Period
-		target_period = map_score_to_period((u32)current_score);
-
-		// 3. 读取当前Period
+		// 读取当前Period（0 = 禁用的Event，跳过）
 		current_period = get_current_period(type);
-		if (current_period == 0) {
-			// trace_printk(
-			// "[Adaptive-Update] Event %d: failed to get current period\n",
-			// type);
+		if (current_period == 0)
 			continue;
-		}
 
-		// 4. EMA平滑调整
+		// EMA平滑调整
 		new_period = apply_ema_to_period(current_period, target_period);
 
-		// 5. 更新硬件Period
+		// 更新硬件Period
 		update_pebs_event_period(type, new_period);
 
 		trace_printk(
@@ -1598,9 +1650,14 @@ int ksamplingd_init(pid_t pid, int node)
 
 void ksamplingd_exit(void)
 {
-	pebs_disable();
+	/* Bug Fix #12: 必须先停止kthread，再pebs_disable。
+	 * 原代码先调pebs_disable（禁用事件+销毁堆），kthread仍在运行，
+	 * 导致kthread卡在内部do-while循环：ring buffer残留数据使cond持续
+	 * 为true，而kthread_stop尚未被调用，循环永远无法退出。
+	 * Baseline版本的顺序即为: kthread_stop → pebs_disable。 */
 	if (access_sampling) {
 		kthread_stop(access_sampling);
 		access_sampling = NULL;
 	}
+	pebs_disable();
 }

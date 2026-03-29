@@ -1247,9 +1247,10 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 	 * ensures threshold tracks the halving. */
 	if (memcg->active_threshold > htmm_thres_hot)
 		memcg->active_threshold--;
-	/* B-fix: extend post-cooling gradual threshold for entire cooling cycle
-	 * to prevent threshold jump that abandons unsampled hot pages */
-	memcg->cooled = htmm_cooling_period / htmm_adaptation_period;
+	/* F5-fix: 恢复 Baseline 的一次性 cooled 标志。
+	 * 原 B-fix 的 cooled=20 不再需要——F4 的阻尼对称调整已防止
+	 * 向上跳变破坏已有热页。 */
+	memcg->cooled = 1;
 
 	/* 优化2.2：重置promote计数器 */
 	memcg->recent_promote_count = 0;
@@ -1306,29 +1307,30 @@ static void __adjust_active_threshold(struct mm_struct *mm,
 	if (idx_bp < htmm_thres_hot)
 		idx_bp = htmm_thres_hot;
 
-	/* H-fix: Asymmetric threshold adjustment.
+	/* F4-fix + F5-fix: 带速度限制的对称阈值调整
 	 *
-	 * G-fix (symmetric ±1) prevented upward threshold jumps that caused
-	 * run13's collapse, but it also prevented fast downward adjustment
-	 * after cooling.  Cooling halves all page indices (idx → idx-1), so
-	 * the threshold must track downward quickly or hot pages appear cold
-	 * and get massively demoted (run15: 597K hot pages wrongly demoted,
-	 * DRAM dropped from 54% → 28%).
-	 *
-	 * Fix: allow threshold to JUMP DOWNWARD (track cooling's halving)
-	 * but only INCREMENT upward by +1 per adaptation period.
-	 * Upward jumps were the original catastrophic failure mode; downward
-	 * jumps are safe because they only make more pages "hot" (= more
-	 * promotions, never mass demotion). */
-	if (memcg->cooled > 0)
-		memcg->cooled--;
-
-	if (idx_hot < memcg->active_threshold) {
-		/* Downward: jump directly to idx_hot (but not below floor) */
-		memcg->active_threshold = max_t(int, idx_hot, htmm_thres_hot);
-	} else if (idx_hot > memcg->active_threshold) {
-		/* 向上: 每次仅 +1，防止阈值跳变导致大规模错误降级 */
-		memcg->active_threshold++;
+	 * cooling 后第一个 adaptation 周期：保守调整（histogram 混乱）
+	 * 之后：双向步长 ≤2，既防 run13 跳变又允许快速恢复 */
+	if (memcg->cooled > 0) {
+		/* cooling 刚发生，保守调整 */
+		if (idx_hot < memcg->active_threshold &&
+		    memcg->active_threshold > htmm_thres_hot)
+			memcg->active_threshold--;
+		memcg->cooled = 0;
+	} else {
+/* 正常模式：阻尼对称调整，每次最多调整 2 步 */
+#define MAX_THRESHOLD_STEP 2
+		if (idx_hot < memcg->active_threshold) {
+			int diff = memcg->active_threshold - idx_hot;
+			int step = min_t(int, diff, MAX_THRESHOLD_STEP);
+			memcg->active_threshold -= step;
+			memcg->active_threshold = max_t(
+				int, memcg->active_threshold, htmm_thres_hot);
+		} else if (idx_hot > memcg->active_threshold) {
+			int diff = idx_hot - memcg->active_threshold;
+			int step = min_t(int, diff, MAX_THRESHOLD_STEP);
+			memcg->active_threshold += step;
+		}
 	}
 	memcg->bp_active_threshold = idx_bp;
 	set_lru_adjusting(memcg, true);
