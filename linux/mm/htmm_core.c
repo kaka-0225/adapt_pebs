@@ -14,6 +14,7 @@
 #include <linux/sched/task.h>
 #include <linux/xarray.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/random.h>
 #include <trace/events/htmm.h>
 
@@ -872,6 +873,9 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
 	unsigned long prev_accessed, prev_idx, cur_idx;
 	bool hot;
+	/* F11: hotness normalization variables */
+	u64 cur_period, ref_period;
+	u32 weight;
 
 	// Adaptive-PEBS: update Welford online variance
 	update_page_fluctuation(pginfo, timestamp);
@@ -882,9 +886,21 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 	/* check cooling status and perform cooling if the page needs to be cooled */
 	check_base_cooling(pginfo, page, false);
 
+	/* F11: Hotness Normalization - 按Period比例加权采样贡献
+	 * F20: REF_PERIOD=199(与Baseline对齐), 启动时weight=199/199=1
+	 * 当CPU quota推高Period时，weight自动补偿以维持正确热度识别
+	 * weight = current_period / reference_period (最小为1)
+	 */
+	cur_period = get_event_period(event_id);
+	ref_period = (event_id == MEMWRITE) ? (u64)htmm_inst_sample_period :
+					      HOTNESS_REF_PERIOD;
+	weight = (u32)div64_u64(cur_period, ref_period);
+	if (weight < 1)
+		weight = 1;
+
 	prev_accessed = pginfo->total_accesses;
-	pginfo->nr_accesses++;
-	pginfo->total_accesses += HPAGE_PMD_NR;
+	pginfo->nr_accesses += weight;
+	pginfo->total_accesses += (u32)weight * HPAGE_PMD_NR;
 
 	prev_idx = get_idx(prev_accessed);
 	cur_idx = get_idx(pginfo->total_accesses);
@@ -924,7 +940,8 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 }
 
 static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
-			     struct page *page, unsigned long address)
+			     struct page *page, unsigned long address,
+			     int event_id)
 {
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
 	struct page *meta_page;
@@ -932,6 +949,9 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	unsigned long prev_idx, cur_idx;
 	bool hot, pg_split = false;
 	unsigned long pginfo_prev;
+	/* F11: hotness normalization variables */
+	u64 cur_period, ref_period;
+	u32 weight;
 
 	meta_page = get_meta_page(page);
 	pginfo = get_compound_pginfo(page, address);
@@ -939,11 +959,19 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 	/* check cooling status */
 	check_transhuge_cooling((void *)memcg, page, false);
 
-	pginfo_prev = pginfo->total_accesses;
-	pginfo->nr_accesses++;
-	pginfo->total_accesses += HPAGE_PMD_NR;
+	/* F11: Hotness Normalization */
+	cur_period = get_event_period(event_id);
+	ref_period = (event_id == MEMWRITE) ? (u64)htmm_inst_sample_period :
+					      HOTNESS_REF_PERIOD;
+	weight = (u32)div64_u64(cur_period, ref_period);
+	if (weight < 1)
+		weight = 1;
 
-	meta_page->total_accesses++;
+	pginfo_prev = pginfo->total_accesses;
+	pginfo->nr_accesses += weight;
+	pginfo->total_accesses += (u32)weight * HPAGE_PMD_NR;
+
+	meta_page->total_accesses += weight;
 
 #ifndef DEFERRED_SPLIT_ISOLATED
 	if (check_split_huge_page(memcg, meta_page, false)) {
@@ -1084,7 +1112,7 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 			goto pmd_unlock;
 		}
 
-		update_huge_page(vma, pmd, page, address);
+		update_huge_page(vma, pmd, page, address, event_id);
 		if (htmm_cxl_mode) {
 			if (page_to_nid(page) == 0)
 				return 1;
@@ -1237,23 +1265,10 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 	reset_memcg_stat(memcg);
 	memcg->cooling_clock++;
 	memcg->bp_active_threshold--;
-	/* H2-fix: proactively lower active_threshold during cooling.
-	 * Cooling halves all total_accesses (idx drops ~1), but post-cooling
-	 * histogram has all cooled pages concentrated in bucket (old_threshold-1).
-	 * With 2.6M pages in that bucket vs 2.3M DRAM capacity, idx_hot computes
-	 * as old_threshold (not old_threshold-1), so __adjust_active_threshold
-	 * never lowers the threshold → hot pages incorrectly become "warm" and
-	 * get demoted when DRAM pressure triggers.  Pre-decrementing here
-	 * ensures threshold tracks the halving. */
-	if (memcg->active_threshold > htmm_thres_hot)
-		memcg->active_threshold--;
-	/* F5-fix: 恢复 Baseline 的一次性 cooled 标志。
-	 * 原 B-fix 的 cooled=20 不再需要——F4 的阻尼对称调整已防止
-	 * 向上跳变破坏已有热页。 */
+	/* F19 (Plan D): 恢复 Baseline cooling 逻辑
+	 * 移除 H2-fix 的 active_threshold-- pre-decrement
+	 * Baseline 只在 __adjust_active_threshold 的 cooled 分支中降阈值 */
 	memcg->cooled = 1;
-
-	/* 优化2.2：重置promote计数器 */
-	memcg->recent_promote_count = 0;
 
 	smp_mb();
 	spin_unlock(&memcg->access_lock);
@@ -1307,39 +1322,36 @@ static void __adjust_active_threshold(struct mm_struct *mm,
 	if (idx_bp < htmm_thres_hot)
 		idx_bp = htmm_thres_hot;
 
-	/* F4-fix + F5-fix: 带速度限制的对称阈值调整
-	 *
-	 * cooling 后第一个 adaptation 周期：保守调整（histogram 混乱）
-	 * 之后：双向步长 ≤2，既防 run13 跳变又允许快速恢复 */
-	if (memcg->cooled > 0) {
-		/* cooling 刚发生，保守调整 */
-		if (idx_hot < memcg->active_threshold &&
-		    memcg->active_threshold > htmm_thres_hot)
-			memcg->active_threshold--;
-		memcg->cooled = 0;
-	} else {
-/* 正常模式：阻尼对称调整，每次最多调整 2 步 */
-#define MAX_THRESHOLD_STEP 2
-		if (idx_hot < memcg->active_threshold) {
-			int diff = memcg->active_threshold - idx_hot;
-			int step = min_t(int, diff, MAX_THRESHOLD_STEP);
-			memcg->active_threshold -= step;
-			memcg->active_threshold = max_t(
-				int, memcg->active_threshold, htmm_thres_hot);
-		} else if (idx_hot > memcg->active_threshold) {
-			int diff = idx_hot - memcg->active_threshold;
-			int step = min_t(int, diff, MAX_THRESHOLD_STEP);
-			memcg->active_threshold += step;
-		}
-	}
-	memcg->bp_active_threshold = idx_bp;
-	set_lru_adjusting(memcg, true);
+	/* F19 (Plan D): 恢复 Baseline 的单向棘轮阈值逻辑
+	 * - cooled 后：idx_hot < threshold 时最多降 1
+	 * - 正常模式：threshold 只能向上跳变（直接赋值到 idx_hot）
+	 * - 移除 F4 的双向阻尼调整，避免阈值持续下沉到 htmm_thres_hot */
+	if (memcg->cooled) {
+		if (idx_hot < memcg->active_threshold)
+			if (memcg->active_threshold > 1)
+				memcg->active_threshold--;
+		if (idx_bp < memcg->bp_active_threshold)
+			memcg->bp_active_threshold = idx_bp;
 
-	if (memcg->need_split) {
-		set_memcg_nr_split(memcg);
-		set_memcg_split_thres(memcg);
-		memcg->nr_sampled_for_split = 0;
-		memcg->need_split = false;
+		memcg->cooled = 0;
+		set_lru_adjusting(memcg, true);
+
+		if (memcg->need_split) {
+			set_memcg_nr_split(memcg);
+			set_memcg_split_thres(memcg);
+			memcg->nr_sampled_for_split = 0;
+			memcg->need_split = false;
+		}
+	} else {
+		if (idx_hot > memcg->active_threshold) {
+			memcg->active_threshold = idx_hot;
+			set_lru_adjusting(memcg, true);
+		} else if (memcg->split_happen && htmm_thres_split &&
+			   idx_hot < memcg->active_threshold) {
+			memcg->active_threshold = idx_hot;
+			set_lru_adjusting(memcg, true);
+		}
+		memcg->bp_active_threshold = idx_bp;
 	}
 
 	/* set warm threshold */

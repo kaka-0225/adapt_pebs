@@ -128,9 +128,10 @@ static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
 #define MAX_PERIOD                                                             \
 	19997ULL // 对齐 pebs_period_list[29]（Baseline 最稀，避免超出 Baseline 曾达到的范围）
 
-// F2-fix: 初始 Period 使用中间值，避免 MIN 的启动风暴和 MAX 的冷启动陷阱
-// pebs_period_list[15] = 3001：比 MIN(199) 低 15 倍采样率，比 MAX(19997) 高 6.6 倍
-#define INIT_PERIOD 3001ULL
+// F20: 对齐 Baseline 初始 Period = 199（pebs_period_list[0]）
+// V13 发现 period=3001 导致采样频率比 Baseline(199) 低 15×
+// → cooling 间隔 15× 长 → 页面过度积累 → 100× 热页 → Phase 2 崩溃
+#define INIT_PERIOD 199ULL
 
 // 全局采样预算控制（优化1.1）
 #define MAX_SAMPLES_PER_WINDOW 2000000 // 10秒窗口最多200万次采样
@@ -141,6 +142,36 @@ static struct adaptive_metrics global_adaptive_metrics[EVENT_TYPE_MAX];
 #define ADAPTIVE_UPDATE_INTERVAL_SEC 10 // 10秒
 #define ADAPTIVE_UPDATE_INTERVAL_MS                                            \
 	(ADAPTIVE_UPDATE_INTERVAL_SEC * 1000) // 10000毫秒
+
+// F18: Fixed Ratio — 锁定 ratio=1000（所有 Event 使用相同 base_period）
+// F19: 回归 Baseline 单向棘轮阈值逻辑（__cooling + __adjust_active_threshold）
+// F20: 对齐 Baseline 采样频率 — 根因修复
+//   V13发现: period=3001(idx=15) vs Baseline=199(idx=0) → 15×采样差
+//   → cooling基于采样计数(nr_sampled%2M)，但wall-clock时间差15×
+//   → 页面在cooling间隔内过度积累 → 100×热页 → Phase 2崩溃(7.5s vs 2.2s)
+//   修复: INIT_PERIOD=199, base_period_index=0, 解锁MIN/MAX让CPU quota调节
+//   HOTNESS_REF_PERIOD=199, 使F11 weight始终=1(与Baseline一致)
+
+// F20: 解锁 base_period_index，由 ksamplingd CPU quota 自然调节
+// Baseline 从 index=0(199) 启动，CPU占用率低时保持不变
+// 解锁后 adaptive 与 Baseline 采样行为完全对齐
+#define MIN_BASE_PERIOD_INDEX 0 /* pebs_period_list[0]=199, 与 Baseline 对齐 */
+#define MAX_BASE_PERIOD_INDEX                                                  \
+	29 /* pebs_period_list[29]=19997, 与 Baseline 对齐 */
+
+// ksamplingd 写入，adaptive timer 读取（初始对齐 Baseline: index=0, period=199）
+static unsigned long base_period_index = 0; // pebs_period_list[0]=199
+static unsigned long base_inst_period_index =
+	0; // pebs_inst_period_list[0]=100003
+
+// F15: adaptive timer → ksamplingd 的比例传递通道
+// adaptive timer（写者）计算 V_norm 比例，ksamplingd（读者）应用到硬件
+// ×1000 定点: 1000=1.0×, 333=0.333×, 3000=3.0×
+static atomic64_t adaptive_nvm_ratio = ATOMIC64_INIT(1000);
+static atomic64_t adaptive_write_ratio = ATOMIC64_INIT(1000);
+
+// scale factor 钳位范围（整数运算：用分子/分母表示最小值 1/3）
+#define PERIOD_SCALE_MAX 3 // scale 上限 3.0×（最多疏3倍）
 
 // 定时器
 static struct delayed_work adaptive_update_work;
@@ -201,7 +232,11 @@ static __u64 get_pebs_event(enum events e)
 	case DRAMREAD:
 		return ICL_LOCAL_DRAM;
 	case NVMREAD:
-		return ICL_LOCAL_PMM;
+		/* F22-fix: 禁用 NVM READ，对齐 Baseline (htmm_cxl_mode=false)
+		 * Baseline 只用 DRAMREAD+MEMWRITE 两个事件
+		 * NVM READ (period=199) 会让 NVM 页积累与 DRAM 页同等热度
+		 * → 阈值无法区分冷热 → 热页永远无法被促升到 DRAM */
+		return N_HTMMEVENTS;
 	case MEMWRITE:
 		return ICL_ALL_STORES;
 	default:
@@ -232,17 +267,15 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 	// } else {
 	// 	attr.sample_period = get_sample_period(0); // 199 fallback
 	// }
-	/* F2-fix: 初始Period使用中间值INIT_PERIOD=3001
-	 * 原Bug Fix #7用MIN_PERIOD=199导致启动风暴→heap秒满→renewal=0→死亡螺旋。
-	 * 原代码用MAX_PERIOD=19997导致冷启动陷阱→无采样→adaptive无意义。
-	 * INIT_PERIOD=3001(pebs_period_list[15])平衡两端：
-	 *   10秒内~3.3万次采样，足够启动但不会淹没heap。
-	 * MEMWRITE保持原始配置值。
+	/* F20: 初始Period对齐Baseline = 199 (pebs_period_list[0])
+	 * V13发现: period=3001导致采样频率比Baseline(199)低15×
+	 * → cooling间隔15×长 → 100×热页 → Phase 2崩溃
+	 * 现在与Baseline完全一致: DRAMREAD/NVMREAD=199, MEMWRITE=100003
 	 */
 	if (type == MEMWRITE) {
 		attr.sample_period = htmm_inst_sample_period;
 	} else {
-		attr.sample_period = INIT_PERIOD; /* 3001: 中间值启动 */
+		attr.sample_period = INIT_PERIOD; /* F20: 199, 与Baseline一致 */
 	}
 
 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR |
@@ -437,6 +470,27 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 {
 	int cpu, event;
 
+	/* F12: 同步更新 tracked_periods[]，使 get_event_period() (F11) 能
+	 * 读到 ksamplingd 逐格步进后的实际 period 值 */
+	{
+		enum event_type etype;
+		for (etype = 0; etype < EVENT_TYPE_MAX; etype++) {
+			if (tracked_periods[etype] == 0)
+				continue; /* 跳过禁用的Event */
+			switch (etype) {
+			case EVENT_MEM_WRITE:
+				tracked_periods[etype] = inst_value;
+				break;
+			case EVENT_DRAM_READ:
+			case EVENT_NVM_READ:
+				tracked_periods[etype] = value;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
 	for_each_online_cpu (cpu) {
 		for (event = 0; event < N_HTMMEVENTS; event++) {
 			int ret;
@@ -471,6 +525,82 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 				printk("failed to update sample period");
 		}
 	}
+}
+
+/**
+ * F15: ksamplingd 统一写全部硬件 — 将 adaptive ratio 应用到 NVM/WRITE
+ *
+ * ksamplingd 是唯一的硬件写入者，每次配额 check(15s):
+ *   DRAM_READ + L3: 直接用 llc_value（由 base_period_index 步进）
+ *   NVM_READ:  llc_value × adaptive_nvm_ratio / 1000
+ *   MEM_WRITE: inst_value × adaptive_write_ratio / 1000
+ *
+ * adaptive timer 不再写硬件，只更新 ratio（原子变量）
+ */
+static void pebs_update_all_with_ratios(uint64_t llc_value, uint64_t inst_value)
+{
+	int cpu, event;
+	s64 nvm_ratio = atomic64_read(&adaptive_nvm_ratio);
+	s64 write_ratio = atomic64_read(&adaptive_write_ratio);
+	u64 nvm_period, write_period;
+
+	/* 计算 NVM period */
+	nvm_period = div64_u64(llc_value * (u64)nvm_ratio, 1000);
+	if (nvm_period < MIN_PERIOD)
+		nvm_period = MIN_PERIOD;
+	if (nvm_period > MAX_PERIOD)
+		nvm_period = MAX_PERIOD;
+
+	/* 计算 WRITE period */
+	write_period = div64_u64(inst_value * (u64)write_ratio, 1000);
+	if (write_period < 100003)
+		write_period = 100003;
+	if (write_period > 1500003)
+		write_period = 1500003;
+
+	/* 同步 tracked_periods（F11 热度归一化读取） */
+	if (tracked_periods[EVENT_DRAM_READ] != 0)
+		tracked_periods[EVENT_DRAM_READ] = llc_value;
+	if (tracked_periods[EVENT_NVM_READ] != 0)
+		tracked_periods[EVENT_NVM_READ] = nvm_period;
+	if (tracked_periods[EVENT_MEM_WRITE] != 0)
+		tracked_periods[EVENT_MEM_WRITE] = write_period;
+
+	/* 写全部硬件 */
+	for_each_online_cpu (cpu) {
+		for (event = 0; event < N_HTMMEVENTS; event++) {
+			int ret;
+			if (!mem_event[cpu][event])
+				continue;
+
+			switch (event) {
+			case DRAMREAD:
+			case L3_HIT:
+			case L3_MISS:
+				ret = perf_event_period(mem_event[cpu][event],
+							llc_value);
+				break;
+			case NVMREAD:
+				ret = perf_event_period(mem_event[cpu][event],
+							nvm_period);
+				break;
+			case MEMWRITE:
+				ret = perf_event_period(mem_event[cpu][event],
+							write_period);
+				break;
+			default:
+				ret = 0;
+				break;
+			}
+			if (ret == -EINVAL)
+				printk("F15: failed to update period event=%d\n",
+				       event);
+		}
+	}
+
+	trace_printk(
+		"[Ksampled-Apply] dram=%llu nvm_ratio=%lld nvm=%llu write_ratio=%lld write=%llu\n",
+		llc_value, nvm_ratio, nvm_period, write_ratio, write_period);
 }
 
 /**
@@ -607,8 +737,10 @@ static int ksamplingd(void *data)
 	unsigned long total_cputime, elapsed_cputime, cur;
 	/* used for periodic checks*/
 	unsigned long cpucap_period = msecs_to_jiffies(15000); // 15s
-	unsigned long sample_period = 0;
-	unsigned long sample_inst_period = 0;
+	/* F14: sample_period/inst 跟随全局 base_period_index（ksamplingd 与 adaptive 共享）
+	 * 保留局部变量用于 increase/decrease_sample_period 操作 */
+	unsigned long sample_period = base_period_index;
+	unsigned long sample_inst_period = base_inst_period_index;
 	/* report cpu/period stat */
 	unsigned long trace_cputime,
 		trace_period = msecs_to_jiffies(1500); // 3s
@@ -794,68 +926,50 @@ static int ksamplingd(void *data)
 						    elapsed_cputime);
 
 			/* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
-			/* Adaptive-PEBS: 当自适应定时器运行时，Period
-			 * 由 adaptive_update_work_handler 控制，此处
-			 * 仅作为硬上限安全网：CPU 超过 HARD_CPU_LIMIT
-			 * 时强制增加 Period 防止 soft lockup。
-			 * 不运行自适应定时器时保留原始双向调节逻辑。
-			 */
-			if (adaptive_timer_running) {
-				/* F3-fix: 恢复 CPU cap 安全阀
-				 * CPU 超限时放大 tracked_periods[]，
-				 * adaptive timer 下次回调以新基准值做 EMA。
-				 * 不直接调用 pebs_update_period() 避免与
-				 * adaptive timer 的 EMA 逻辑冲突。 */
-				if (cputime > (ksampled_soft_cpu_quota + 5)) {
-					enum event_type etype;
-					for (etype = 0; etype < EVENT_TYPE_MAX;
-					     etype++) {
-						u64 cur_p =
-							tracked_periods[etype];
-						if (cur_p == 0)
-							continue;
-						cur_p = cur_p *
-							SCALE_UP_FACTOR /
-							SCALE_DOWN_FACTOR;
-						if (cur_p > MAX_PERIOD)
-							cur_p = MAX_PERIOD;
-						tracked_periods[etype] = cur_p;
-					}
+			/* F15: ksamplingd 是唯一硬件写入者
+			 * increase/decrease 步进 base index 后，统一调用
+			 * pebs_update_all_with_ratios() 写全部硬件（含 adaptive ratio）
+			 * 死区内也重新写硬件，确保 ratio 变化 ≤15s 生效 */
+			if (cputime > (ksampled_soft_cpu_quota + 5) &&
+			    sample_period < MAX_BASE_PERIOD_INDEX &&
+			    sample_period != pcount) {
+				/* F17: 仅当 base_idx < 上限(15) 时才允许 increase */
+				unsigned long tmp1 = sample_period,
+					      tmp2 = sample_inst_period;
+				increase_sample_period(&sample_period,
+						       &sample_inst_period);
+				if (tmp1 != sample_period ||
+				    tmp2 != sample_inst_period) {
+					base_period_index = sample_period;
+					base_inst_period_index =
+						sample_inst_period;
 				}
-			} else {
-				if (cputime > (ksampled_soft_cpu_quota + 5) &&
-				    sample_period != pcount) {
-					/* need to increase the sample period */
-					unsigned long tmp1 = sample_period,
-						      tmp2 = sample_inst_period;
-					increase_sample_period(
-						&sample_period,
-						&sample_inst_period);
-					if (tmp1 != sample_period ||
-					    tmp2 != sample_inst_period)
-						pebs_update_period(
-							get_sample_period(
-								sample_period),
-							get_sample_inst_period(
-								sample_inst_period));
-				} else if (cputime < (ksampled_soft_cpu_quota -
-						      5) &&
-					   sample_period) {
-					unsigned long tmp1 = sample_period,
-						      tmp2 = sample_inst_period;
-					decrease_sample_period(
-						&sample_period,
-						&sample_inst_period);
-					if (tmp1 != sample_period ||
-					    tmp2 != sample_inst_period)
-						pebs_update_period(
-							get_sample_period(
-								sample_period),
-							get_sample_inst_period(
-								sample_inst_period));
+			} else if (cputime < (ksampled_soft_cpu_quota - 5) &&
+				   sample_period > MIN_BASE_PERIOD_INDEX) {
+				/* F16: 仅当 base_idx > 下限(15) 时才允许 decrease */
+				unsigned long tmp1 = sample_period,
+					      tmp2 = sample_inst_period;
+				decrease_sample_period(&sample_period,
+						       &sample_inst_period);
+				if (tmp1 != sample_period ||
+				    tmp2 != sample_inst_period) {
+					base_period_index = sample_period;
+					base_inst_period_index =
+						sample_inst_period;
 				}
 			}
-			/* does it need to prevent ping-pong behavior? */
+
+			/* F15: 每次配额 check 都写硬件（含死区）
+			 * 确保 adaptive ratio 变化及时生效 */
+			pebs_update_all_with_ratios(
+				get_sample_period(sample_period),
+				get_sample_inst_period(sample_inst_period));
+
+			trace_printk(
+				"[Ksampled-Base] cpu=%llu quota=%u base_idx=%lu base_period=%lu adaptive=%d\n",
+				cputime, ksampled_soft_cpu_quota, sample_period,
+				get_sample_period(sample_period),
+				adaptive_timer_running ? 1 : 0);
 
 			elapsed_cputime = cur;
 			exec_runtime = cur_runtime;
@@ -1326,6 +1440,13 @@ static void adaptive_metrics_init(void)
 			tracked_periods[type] = 0; /* 禁用的Event */
 	}
 
+	// F15: 重置全局状态，消除跨 benchmark 污染
+	// F20: 重置到 index=0 (period=199)，对齐 Baseline
+	base_period_index = 0; /* F20: INIT_PERIOD=199 */
+	base_inst_period_index = 0; /* 100003 */
+	atomic64_set(&adaptive_nvm_ratio, 1000);
+	atomic64_set(&adaptive_write_ratio, 1000);
+
 	// ========================================================================
 	// Phase 3.2: 启动周期性Period自适应更新定时器
 	// ========================================================================
@@ -1426,6 +1547,21 @@ static u64 get_current_period(enum event_type type)
 }
 
 /**
+ * get_event_period - 返回指定Event的当前采样Period（供外部模块使用）
+ * @event_id: Event编号（对应 enum events / enum event_type: 0-8）
+ *
+ * F11: 供htmm_core.c进行热度归一化计算。
+ * 返回tracked_periods中记录的当前Period，无效时返回INIT_PERIOD。
+ */
+u64 get_event_period(int event_id)
+{
+	if (event_id >= 0 && event_id < EVENT_TYPE_MAX &&
+	    tracked_periods[event_id] > 0)
+		return tracked_periods[event_id];
+	return INIT_PERIOD;
+}
+
+/**
  * update_pebs_event_period - 更新所有CPU的Event Period
  * @type: Event类型
  * @new_period: 新的Period值
@@ -1467,29 +1603,31 @@ static void update_pebs_event_period(enum event_type type, u64 new_period)
 }
 
 /**
- * adaptive_update_work_handler - 定时器回调，执行Period自适应更新
+ * adaptive_update_work_handler - F15 纯顾问：只计算 ratio，不写硬件
  * @work: delayed_work结构体
- * 
- * 每10秒执行一次，遍历所有Event类型：
- * 1. 读取当前分数
- * 2. 计算目标Period
- * 3. EMA平滑调整
- * 4. 更新硬件Period
- * 5. 重新调度定时器
+ *
+ * 每10秒执行一次：
+ * 1. 堆老化（保留）
+ * 2. 计算各 Event 的 V_normalized 分数
+ * 3. 读取 base_period_index（由 ksamplingd 控制）
+ * 4. 全部活跃事件（DRAM+NVM+WRITE）参与 avg_vnorm 计算
+ * 5. 计算 NVM/WRITE 的 ratio = avg/vi，存入 atomic 变量
+ *    ksamplingd 下次配额 check 时读取并应用到硬件
+ *
+ * F15 vs F14: adaptive timer 不再写硬件，ksamplingd 是唯一写入者
  */
 void adaptive_update_work_handler(struct work_struct *work)
 {
 	enum event_type type;
-
-	// printk(KERN_INFO "[HTMM-Adaptive] Timer callback triggered\n");
-	// trace_printk("[Adaptive-Update] ===== Periodic update triggered =====\n");
+	int active_count = 0;
+	u64 vnorm_sum = 0;
+	u32 vnorms[EVENT_TYPE_MAX] = { 0 };
+	u32 avg_vnorm;
+	unsigned long cur_base_idx, cur_inst_idx;
+	u64 base_period, base_inst_period;
 
 	// -----------------------------------------------------------------------
-	// 堆老化：对所有 Event 堆的 hit_count 进行指数衰减（每轮 ×0.7）
-	// 目的：使长期不被采样的页面 hit_count 自然衰减趋向 0/1，
-	//       配合修复#5 的替换条件（<=1），确保新热页能持续进入堆。
-	// 衰减后用 Floyd 算法（从最后非叶子节点向上 sift_down）重建堆性质。
-	// 必须在 calculate_adaptive_metrics() 之前执行，保证分数使用最新堆状态。
+	// 堆老化：对所有 Event 堆的 hit_count 进行指数衰减（每轮 ×0.85）
 	// -----------------------------------------------------------------------
 	{
 		u32 heap_i;
@@ -1500,16 +1638,11 @@ void adaptive_update_work_handler(struct work_struct *work)
 
 			spin_lock_irqsave(&heap->lock, heap_flags);
 
-			/* F9-fix: 老化因子从 ×0.7 改为 ×0.85
-			 * ×0.7 衰减太快：hit=100 经12轮(120s)即降至1，热页难以维持。
-			 * ×0.85：hit=100 经28轮(280s)降至1，热页存活所需采样频率减半。
-			 * 效果：堆更稳定 → replacements↓ → renewal score↓ */
 			for (heap_i = 0; heap_i < heap->size; heap_i++)
 				heap->entries[heap_i].event_hit_count =
 					heap->entries[heap_i].event_hit_count *
 					85 / 100;
 
-			// Floyd 建堆：从最后一个非叶子节点向上重建最小堆性质
 			if (heap->size > 1) {
 				for (heap_i = heap->size / 2; heap_i-- > 0;)
 					heap_sift_down(heap, heap_i);
@@ -1519,78 +1652,123 @@ void adaptive_update_work_handler(struct work_struct *work)
 		}
 	}
 
-	// 先计算指标（使用本窗口累积的统计数据）
+	// 计算指标
 	calculate_adaptive_metrics();
 
-	// Bug Fix #8: 先保存总采样数，然后立即重置统计窗口
-	// 原来budget超限时goto reschedule跳过了stats reset，导致统计跨窗口累积
+	// 重置统计窗口
 	{
 		u64 window_total_samples = 0;
-		u64 cur_period, scaled;
 
 		for (type = 0; type < EVENT_TYPE_MAX; type++)
 			window_total_samples +=
 				global_heap_stats[type].total_samples;
 
-		// 立即重置统计窗口（无论是否超过预算）
 		for (type = 0; type < EVENT_TYPE_MAX; type++) {
 			global_heap_stats[type].total_samples = 0;
 			global_heap_stats[type].heap_insertions = 0;
 			global_heap_stats[type].heap_replacements = 0;
 		}
 
-		// 预算控制：如果总采样量超过预算，统一放大所有Event的Period
 		if (window_total_samples > MAX_SAMPLES_PER_WINDOW) {
-			for (type = 0; type < EVENT_TYPE_MAX; type++) {
-				cur_period = get_current_period(type);
-				if (cur_period == 0)
-					continue; /* 跳过禁用的Event */
-				scaled = cur_period * SCALE_UP_FACTOR /
-					 SCALE_DOWN_FACTOR;
-				scaled = min_t(u64, scaled, MAX_PERIOD);
-				update_pebs_event_period(type, scaled);
-			}
-			// 预算超限，跳过本轮自适应调整
+			trace_printk(
+				"[Adaptive-Alloc] Budget exceeded: %llu samples, skip allocation\n",
+				window_total_samples);
 			goto reschedule;
 		}
 	}
 
-	// 遍历所有Event类型
+	// -----------------------------------------------------------------------
+	// F15: 收集 V_norm — DRAM+NVM+WRITE 全部参与 avg（3事件均值更稳定）
+	// -----------------------------------------------------------------------
 	for (type = 0; type < EVENT_TYPE_MAX; type++) {
 		struct adaptive_metrics *metrics =
 			&global_adaptive_metrics[type];
-		u64 current_score, target_period, current_period, new_period;
+		u64 current_period = get_current_period(type);
 
-		// 1. 读取当前分数
-		current_score = metrics->V_normalized;
-
-		// F1-fix: V_norm=0 时不再跳过，而是将 target 设为 MAX_PERIOD
-		// EMA 平滑确保 period 逐步增大（每10秒窗口靠近30%），而非冻结
-		if (current_score == 0) {
-			target_period = MAX_PERIOD;
-		} else {
-			target_period = map_score_to_period((u32)current_score);
-		}
-
-		// 读取当前Period（0 = 禁用的Event，跳过）
-		current_period = get_current_period(type);
 		if (current_period == 0)
-			continue;
+			continue; /* 跳过禁用的 Event */
 
-		// EMA平滑调整
-		new_period = apply_ema_to_period(current_period, target_period);
-
-		// 更新硬件Period
-		update_pebs_event_period(type, new_period);
+		vnorms[type] = metrics->V_normalized;
 
 		trace_printk(
-			"[Adaptive-Period] Event=%d period=%llu->%llu target=%llu score=%llu\n",
-			type, current_period, new_period, target_period,
-			current_score);
+			"[Adaptive-Score] Event=%d V_norm=%u cur_period=%llu\n",
+			type, metrics->V_normalized, current_period);
+
+		/* F15: 全部活跃事件参与 avg（包括 DRAM） */
+		active_count++;
+		vnorm_sum += metrics->V_normalized;
 	}
 
+	if (active_count == 0)
+		goto reschedule;
+
+	avg_vnorm = (u32)div64_u64(vnorm_sum, active_count);
+
+	// -----------------------------------------------------------------------
+	// F14: 读取 ksamplingd 的 base_period_index，计算 base period
+	// -----------------------------------------------------------------------
+	cur_base_idx = READ_ONCE(base_period_index);
+	cur_inst_idx = READ_ONCE(base_inst_period_index);
+	base_period = get_sample_period(cur_base_idx);
+	base_inst_period = get_sample_inst_period(cur_inst_idx);
+
+	// -----------------------------------------------------------------------
+	// F15: 计算 NVM/WRITE 比例，存入 atomic 变量供 ksamplingd 读取
+	// DRAM 始终 ratio=1.0（由 ksamplingd base_period 直接控制）
+	// -----------------------------------------------------------------------
+	// V15: 解锁 ratio 自适应，恢复 ratio = avg_vnorm * 1000 / vnorms[type]
+	// F21-fix: NVM ratio 钳位 ≤ 1000，确保 NVM period ≤ base_period
+	//   防止 nvm_ratio 爆炸到 2000-3000 导致 NVM 页面降采样 → 热度识别失败
+	//   语义：NVM 只能被采样得"更密"（ratio<1000），不能"更稀"
+	//   WRITE ratio 不钳位（不影响 NVM→DRAM 促升决策）
+	{
+		s64 nvm_ratio_new = 1000;
+		s64 write_ratio_new = 1000;
+
+		for (type = 0; type < EVENT_TYPE_MAX; type++) {
+			s64 ratio;
+
+			if (get_current_period(type) == 0)
+				continue;
+
+			/* ratio = avg / vi, 以千分位表示 */
+			if (vnorms[type] > 0)
+				ratio = (s64)avg_vnorm * 1000 /
+					(s64)vnorms[type];
+			else
+				ratio = 1000; /* vnorm=0 → 保持 1:1 */
+
+			/* 钳位到合理范围 [100, 10000] */
+			if (ratio < 100)
+				ratio = 100;
+			if (ratio > 10000)
+				ratio = 10000;
+
+			if (type == EVENT_NVM_READ) {
+				/* F21-fix: NVM ratio ≤ 1000
+				 * 确保 NVM period ≤ base_period
+				 * → NVM 采样至少和 DRAM 一样密 */
+				nvm_ratio_new = min_t(s64, ratio, 1000);
+			} else if (type == EVENT_MEM_WRITE) {
+				write_ratio_new = ratio;
+			}
+
+			trace_printk(
+				"[Adaptive-Ratio] Event=%d vnorm=%u avg=%u ratio=%lld/1000\n",
+				type, vnorms[type], avg_vnorm, ratio);
+		}
+
+		atomic64_set(&adaptive_nvm_ratio, nvm_ratio_new);
+		atomic64_set(&adaptive_write_ratio, write_ratio_new);
+	}
+
+	trace_printk(
+		"[Adaptive-Summary] active=%d avg_vnorm=%u base_idx=%lu base_period=%llu nvm_ratio=%lld write_ratio=%lld\n",
+		active_count, avg_vnorm, cur_base_idx, base_period,
+		atomic64_read(&adaptive_nvm_ratio),
+		atomic64_read(&adaptive_write_ratio));
+
 reschedule:
-	// 重新调度下一次定时器 (10秒后)
 	if (adaptive_timer_running) {
 		schedule_delayed_work(
 			&adaptive_update_work,

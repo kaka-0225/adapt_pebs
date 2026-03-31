@@ -241,3 +241,9 @@ extern void kmigraterd_stop(void);
 #define AP_SCALE_SHIFT 10 // 放大 1024 倍 (2^10)
 extern void update_page_fluctuation(pginfo_t *pinfo, u64 now);
 extern void update_event_heap_from_sample(int event_id, pginfo_t *pinfo);
+
+// F11: Hotness Normalization - 热度归一化
+// 参考Period = Baseline 初始值 199，weight = cur_period / REF_PERIOD (≥1)
+// F20: REF_PERIOD 对齐 INIT_PERIOD=199，启动时 weight=199/199=1
+#define HOTNESS_REF_PERIOD 199ULL
+extern u64 get_event_period(int event_id);
